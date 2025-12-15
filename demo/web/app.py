@@ -841,15 +841,15 @@ async def websocket_stream(ws: WebSocket) -> None:
             enqueue_log("ready_for_audio")
             await flush_logs()
             
-               # Start all tasks concurrently
-               # STT will wait for audio_ready event before processing
+            # Start all tasks concurrently
+            # STT will wait for audio_ready event before processing
             audio_task = asyncio.create_task(handle_audio_stream())
-               stt_task = asyncio.create_task(run_stt())
-               tts_task = asyncio.create_task(run_tts_from_queue())
+            stt_task = asyncio.create_task(run_stt())
+            tts_task = asyncio.create_task(run_tts_from_queue())
            
-               # Wait for all tasks to complete
+            # Wait for all tasks to complete
             try:
-                   await asyncio.gather(audio_task, stt_task, tts_task)
+                await asyncio.gather(audio_task, stt_task, tts_task)
             except asyncio.CancelledError:
                 pass
             finally:
