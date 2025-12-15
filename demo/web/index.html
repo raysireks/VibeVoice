@@ -1231,6 +1231,7 @@
       
       // Set up TTS audio playback chain (for receiving and playing TTS audio)
       createAudioChain();
+      isPlaying = true;  // Mark as playing so stop() works correctly
       
       audioSocket = new WebSocket(wsUrl);
       audioSocket.binaryType = 'arraybuffer';
