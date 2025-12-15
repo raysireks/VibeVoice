@@ -443,8 +443,7 @@ class StreamingTTSService:
                     except Exception as e:
                         print(f"[stt] Transcription error: {e}")
                         emit("transcription_error", message=str(e))
-                        
-        except GeneratorExit:
+        finally:
             # Handle remaining audio in buffer when stream ends
             if len(audio_buffer) > 0:
                 audio_float = audio_buffer.astype(np.float32) / 32768.0
@@ -520,8 +519,9 @@ async def websocket_stream(ws: WebSocket) -> None:
     
     # Separate lock for STT to allow concurrent streams
     stt_mode = False
-    audio_buffer = []
-    audio_ready = asyncio.Event()  # Signal when audio reception is complete
+    audio_buffer = []  # retained for compatibility, no longer used for streaming
+    audio_chunk_queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
+    audio_done = asyncio.Event()  # signals client sent audio_end / websocket closed
     stt_task = None
     tts_task = None
     text_queue = asyncio.Queue()
@@ -549,7 +549,7 @@ async def websocket_stream(ws: WebSocket) -> None:
                 break
     
     async def handle_audio_stream() -> None:
-        """Handle incoming audio chunks and feed to STT."""
+        """Handle incoming audio chunks and feed to STT in near-real-time."""
         try:
             print("[audio] Starting audio reception handler")
             while ws.client_state == WebSocketState.CONNECTED:
@@ -557,12 +557,10 @@ async def websocket_stream(ws: WebSocket) -> None:
                     # Receive audio chunk with timeout
                     message = await asyncio.wait_for(ws.receive(), timeout=30.0)
                     
-                    # Starlette/uvicorn websocket.receive returns dict with 'type': 'websocket.receive'
-                    # and either 'bytes' or 'text'. Check payload presence instead of type field.
                     chunk = message.get("bytes")
                     if chunk is not None:
-                        audio_buffer.append(chunk)
-                        print(f"[audio] Received {len(chunk)} bytes, total buffer: {len(audio_buffer)} chunks")
+                        await audio_chunk_queue.put(chunk)
+                        print(f"[audio] Received {len(chunk)} bytes (queue size: {audio_chunk_queue.qsize()})")
                         continue
 
                     text_payload = message.get("text")
@@ -582,7 +580,6 @@ async def websocket_stream(ws: WebSocket) -> None:
                             pass
                         continue
 
-                    # Ignore other message types (e.g., pings)
                 except asyncio.TimeoutError:
                     print("[audio] Timeout waiting for audio data")
                     enqueue_log("audio_timeout")
@@ -593,56 +590,45 @@ async def websocket_stream(ws: WebSocket) -> None:
         except Exception as e:
             print(f"[audio_stream] Error: {e}")
         finally:
-            print(f"[audio] Reception complete, total chunks: {len(audio_buffer)}")
-            audio_ready.set()  # Signal that audio is ready for processing
+            print("[audio] Reception complete. Signaling audio_done.")
+            audio_done.set()
+            # Sentinel None to unblock consumers
+            await audio_chunk_queue.put(None)
             enqueue_log("audio_reception_complete")
     
     async def run_stt() -> None:
-        """Run STT on buffered audio and feed to TTS."""
+        """Run STT on streaming audio and feed to TTS."""
         try:
-            # Wait for audio reception to signal completion
-            print("[stt] Waiting for audio reception to complete...")
-            await audio_ready.wait()
-            print(f"[stt] Audio reception complete, buffer has {len(audio_buffer)} chunks")
-            
-            # Concatenate all audio chunks
-            if not audio_buffer:
-                print("[stt] No audio data received")
-                await text_queue.put(None)  # Signal completion
-                return
-            
-            full_audio = b"".join(audio_buffer)
-            
-            # Create generator from audio bytes
-            def audio_gen():
-                # Yield in small chunks to simulate streaming
-                chunk_size = 3200  # 200ms at 16kHz
-                for i in range(0, len(full_audio), chunk_size):
-                    yield full_audio[i:i+chunk_size]
-            
-            # Run STT with streaming
             enqueue_log("stt_started")
             transcribed_text = ""
-            
+
+            async def audio_gen():
+                # Consume from queue as chunks arrive; stop on sentinel None
+                while True:
+                    chunk = await audio_chunk_queue.get()
+                    if chunk is None:
+                        break
+                    yield chunk
+
             stt_gen = service.stream_stt(
                 audio_gen(),
                 log_callback=enqueue_log
             )
-            
+
             async for result in stt_gen:
                 text = result.get("text", "").strip()
                 is_final = result.get("is_final", False)
-                
+
                 if text:
                     transcribed_text += text + " "
                     # Queue text for TTS processing
                     await text_queue.put(text)
                     enqueue_log("transcription_update", text=transcribed_text.strip(), is_final=is_final)
-            
+
             # Signal that STT is complete
             await text_queue.put(None)
             enqueue_log("stt_completed")
-            
+
         except Exception as e:
             print(f"[stt_task] Error: {e}")
             enqueue_log("stt_error", message=str(e))
