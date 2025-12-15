@@ -34,7 +34,8 @@ dependencies = [
     "aiortc",
     "uvicorn[standard]",
     "fastapi",
-    "faster-whisper"
+    "faster-whisper",
+    "nltk"
 ]
 
 

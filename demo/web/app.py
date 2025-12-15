@@ -405,52 +405,85 @@ class StreamingTTSService:
     @staticmethod
     def extract_complete_sentences(buffer: str) -> Tuple[list, str]:
         """
-        Extract complete sentences from a text buffer using regex-based sentence boundary detection.
+        Extract complete sentences from accumulated transcribed text using NLTK's punkt tokenizer.
+        
+        This works on the raw transcribed text WITHOUT relying on Whisper's punctuation,
+        using statistical patterns to detect sentence boundaries.
         
         Returns:
             Tuple of (list of complete sentences, remaining incomplete text)
         
         Example:
-            >>> extract_complete_sentences("Hello world. How are you doing")
-            (["Hello world."], "How are you doing")
+            >>> extract_complete_sentences("hello world how are you doing today")
+            (["hello world", "how are you doing today"], "")
         """
-        import re
-        
-        # Common abbreviations that should NOT trigger sentence breaks
-        abbreviations = {"Dr", "Mr", "Mrs", "Ms", "Prof", "Sr", "Jr", "Inc", "Ltd", "Co", "etc", "vs", "i.e", "e.g"}
-        
-        # Regex pattern: sentence-ending punctuation (.!?) followed by space + capital letter OR end of string
-        # Also handles multiple punctuation (e.g., "..." or "!!")
-        sentence_pattern = r'([.!?]+)(?:\s+(?=[A-Z])|$)'
+        import nltk
+        try:
+            from nltk.tokenize import sent_tokenize
+        except LookupError:
+            # Download punkt tokenizer data if not available
+            import ssl
+            try:
+                _create_unverified_https_context = ssl._create_unverified_context
+            except AttributeError:
+                pass
+            else:
+                ssl._create_default_https_context = _create_unverified_https_context
+            nltk.download('punkt', quiet=True)
+            nltk.download('punkt_tab', quiet=True)
+            from nltk.tokenize import sent_tokenize
         
         if not buffer.strip():
             return [], ""
         
-        sentences = []
-        last_end = 0
+        # Use NLTK's sentence tokenizer which works on raw text without punctuation
+        # It uses statistical patterns to detect sentence boundaries
+        try:
+            detected_sentences = sent_tokenize(buffer)
+        except Exception as e:
+            print(f"[sentence_tokenizer] NLTK tokenization failed: {e}, falling back to word-count chunking")
+            # Fallback: chunk by word count if NLTK fails
+            words = buffer.split()
+            if len(words) < 8:  # Too short, keep buffering
+                return [], buffer
+            # Split into ~10-word chunks
+            sentences = []
+            for i in range(0, len(words), 10):
+                chunk = " ".join(words[i:i+10])
+                if len(chunk.split()) >= 5:  # Only yield if substantial
+                    sentences.append(chunk)
+            remaining = "" if len(words) % 10 == 0 else " ".join(words[-(len(words) % 10):])
+            return sentences, remaining
         
-        for match in re.finditer(sentence_pattern, buffer):
-            end_pos = match.end()
-            candidate = buffer[last_end:end_pos].strip()
-            
-            if not candidate:
-                continue
-            
-            # Check for abbreviations: if sentence ends with "Dr." or "Mr.", don't split
-            words = candidate.split()
-            if words:
-                last_word = words[-1].rstrip('.!?')
-                # If it's an abbreviation and not at the true end, skip this match
-                if last_word in abbreviations and end_pos < len(buffer):
-                    continue
-            
-            sentences.append(candidate)
-            last_end = end_pos
+        if not detected_sentences:
+            return [], buffer
         
-        # Remaining text that doesn't form a complete sentence
-        remaining = buffer[last_end:].strip()
-        
-        return sentences, remaining
+        # If buffer ends mid-sentence (last sentence doesn't look complete), keep it buffered
+        # Heuristic: if last "sentence" is < 5 words and buffer doesn't end with strong punctuation, keep buffering
+        if len(detected_sentences) > 1:
+            complete_sentences = detected_sentences[:-1]
+            last_sentence = detected_sentences[-1]
+            
+            # Check if last sentence looks incomplete (short and no terminal punctuation)
+            word_count = len(last_sentence.split())
+            has_terminal_punct = last_sentence.rstrip().endswith(('.', '!', '?'))
+            
+            if word_count < 5 and not has_terminal_punct:
+                # Keep last sentence in buffer for next window
+                return complete_sentences, last_sentence
+            else:
+                # Last sentence looks complete enough
+                return detected_sentences, ""
+        else:
+            # Only one sentence detected
+            single_sentence = detected_sentences[0]
+            word_count = len(single_sentence.split())
+            
+            # If it's very short (< 5 words) and doesn't end with punctuation, keep buffering
+            if word_count < 5 and not single_sentence.rstrip().endswith(('.', '!', '?')):
+                return [], buffer
+            else:
+                return [single_sentence], ""
 
     async def stream_stt(
         self,
