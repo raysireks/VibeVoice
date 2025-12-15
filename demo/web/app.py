@@ -162,6 +162,27 @@ class StreamingTTSService:
             print(f"[startup] Failed to load Faster Whisper model: {e}")
             self.whisper_model = None
 
+    def _unload_whisper(self) -> None:
+        """Unload Whisper model to free memory (CUDA/CPU)."""
+        if self.whisper_model is None:
+            return
+        try:
+            del self.whisper_model
+        except Exception:
+            pass
+        self.whisper_model = None
+        try:
+            import gc
+
+            gc.collect()
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
     def _load_voice_presets(self) -> Dict[str, Path]:
         voices_dir = BASE.parent / "voices" / "streaming_model"
         if not voices_dir.exists():
@@ -958,18 +979,27 @@ async def websocket_stream(ws: WebSocket) -> None:
             print("[mode] Audio-to-speech mode (STT + TTS)")
             stt_mode = True
             
-            # Reload Whisper model if size has changed (for dynamic model selection)
+            # Reload Whisper model only if not loaded, or if we can detect a different requested size
             current_model_size = None
             if service.whisper_model is not None:
-                # Try to determine current model size from model config
                 try:
-                    current_model_size = getattr(service.whisper_model, 'model_size', None)
+                    current_model_size = getattr(service.whisper_model, "model_size", None)
                 except Exception:
-                    pass
-            
-            if stt_model_size and stt_model_size != current_model_size:
-                print(f"[stt] Reloading Whisper model: {current_model_size} -> {stt_model_size}")
+                    current_model_size = None
+
+            # Avoid double-loading on every connection: only reload when missing, or when we can
+            # positively detect a size mismatch (current size known and differs from requested).
+            should_reload = False
+            if service.whisper_model is None:
+                should_reload = True
+            elif current_model_size is not None and stt_model_size and stt_model_size != current_model_size:
+                should_reload = True
+
+            if should_reload:
+                print(f"[stt] Loading Whisper model: {current_model_size} -> {stt_model_size}")
                 enqueue_log("whisper_model_change", from_model=current_model_size, to_model=stt_model_size)
+                # Free previous model before loading a new one to avoid OOM
+                service._unload_whisper()
                 service._load_whisper(model_size=stt_model_size)
             
             enqueue_log("ready_for_audio")
