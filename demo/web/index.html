@@ -541,6 +541,16 @@
             <span class="helper-text">Max time to wait before triggering TTS. Lower = more responsive. Default: 500ms</span>
           </label>
 
+          <label class="range-control">
+            <span>Silence Flush Time</span>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <input id="ttsSilenceFlushMs" type="range" min="200" max="2000" step="100" value="500" style="flex: 1;" />
+              <span class="range-value" id="ttsSilenceFlushValue" style="min-width: 50px;">500</span>
+              <span style="font-size: 12px; color: var(--text-muted);">ms</span>
+            </div>
+            <span class="helper-text">If silence exceeds this duration, immediately flush buffered text to TTS. Default: 500ms</span>
+          </label>
+
           <label class="range-control" style="flex-direction: row; align-items: center; gap: 10px;">
             <div style="display: flex; align-items: center; gap: 10px;">
               <input id="ttsDisableBatching" type="checkbox" />
@@ -613,6 +623,8 @@
   const ttsMinWordsValue = document.getElementById('ttsMinWordsValue');
   const ttsBufferMsInput = document.getElementById('ttsBufferMs');
   const ttsBufferValue = document.getElementById('ttsBufferValue');
+  const ttsSilenceFlushMsInput = document.getElementById('ttsSilenceFlushMs');
+  const ttsSilenceFlushValue = document.getElementById('ttsSilenceFlushValue');
   const ttsDisableBatchingInput = document.getElementById('ttsDisableBatching');
   const restoreDefaultSettingsBtn = document.getElementById('restoreDefaultSettings');
 
@@ -624,6 +636,7 @@
     stt_model_size: 'large-v3',
     tts_min_words: 5,
     tts_buffer_ms: 500,
+    tts_silence_flush_ms: 500,
     tts_disable_batching: false,
   };
 
@@ -660,6 +673,7 @@
     stt_model_size: sttModelSizeInput.value,
     tts_min_words: parseInt(ttsMinWordsInput.value),
     tts_buffer_ms: parseInt(ttsBufferMsInput.value),
+    tts_silence_flush_ms: parseInt(ttsSilenceFlushMsInput.value),
     tts_disable_batching: Boolean(ttsDisableBatchingInput.checked),
   });
 
@@ -675,6 +689,8 @@
     ttsMinWordsValue.textContent = config.tts_min_words;
     ttsBufferMsInput.value = config.tts_buffer_ms;
     ttsBufferValue.textContent = config.tts_buffer_ms;
+    ttsSilenceFlushMsInput.value = config.tts_silence_flush_ms;
+    ttsSilenceFlushValue.textContent = config.tts_silence_flush_ms;
     ttsDisableBatchingInput.checked = Boolean(config.tts_disable_batching);
   };
 
@@ -1039,6 +1055,13 @@
     saveConfig(currentConfig);
   });
 
+  // TTS silence flush slider
+  ttsSilenceFlushMsInput.addEventListener('input', () => {
+    ttsSilenceFlushValue.textContent = ttsSilenceFlushMsInput.value;
+    currentConfig.tts_silence_flush_ms = parseInt(ttsSilenceFlushMsInput.value);
+    saveConfig(currentConfig);
+  });
+
   // TTS disable batching toggle
   ttsDisableBatchingInput.addEventListener('change', () => {
     currentConfig.tts_disable_batching = Boolean(ttsDisableBatchingInput.checked);
@@ -1304,6 +1327,7 @@
     params.set('stt_model_size', currentConfig.stt_model_size);
     params.set('tts_min_words', currentConfig.tts_min_words);
     params.set('tts_buffer_ms', currentConfig.tts_buffer_ms);
+    params.set('tts_silence_flush_ms', currentConfig.tts_silence_flush_ms);
     params.set('tts_disable_batching', currentConfig.tts_disable_batching ? '1' : '0');
     const wsUrl = `${location.origin.replace(/^http/, 'ws')}/stream?${params.toString()}`;
 
@@ -1548,6 +1572,7 @@
       params.set('stt_model_size', currentConfig.stt_model_size);
       params.set('tts_min_words', currentConfig.tts_min_words);
       params.set('tts_buffer_ms', currentConfig.tts_buffer_ms);
+      params.set('tts_silence_flush_ms', currentConfig.tts_silence_flush_ms);
       params.set('tts_disable_batching', currentConfig.tts_disable_batching ? '1' : '0');
       const wsUrl = `${location.origin.replace(/^http/, 'ws')}/stream?${params.toString()}`;
       
