@@ -480,6 +480,10 @@ class StreamingTTSService:
 
 
 
+# FastAPI application instance
+app = FastAPI()
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     model_path = os.environ.get("MODEL_PATH")
