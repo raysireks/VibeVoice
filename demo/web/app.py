@@ -409,6 +409,8 @@ class StreamingTTSService:
         stt_window_ms: Optional[int] = None,
         stt_silence_db: Optional[float] = None,
         strip_punctuation: Optional[bool] = None,
+        silence_flush_event: Optional[asyncio.Event] = None,
+        silence_flush_ms: Optional[int] = None,
     ) -> Iterator[Dict[str, Any]]:
         """
         Stream speech-to-text using Faster Whisper with partial transcriptions.
@@ -422,6 +424,8 @@ class StreamingTTSService:
             stt_window_ms: Optional window size in milliseconds (default 1000)
             stt_silence_db: Optional silence threshold in dB (default -40)
             strip_punctuation: Remove punctuation from partial transcripts (default True)
+            silence_flush_event: Event to signal extended silence (for TTS flush)
+            silence_flush_ms: Silence duration threshold to trigger flush (default 500ms)
             
         Yields:
             Dicts with keys: {'text': str, 'is_final': bool, 'timestamp_ms': float}
@@ -443,6 +447,8 @@ class StreamingTTSService:
             stt_silence_db = float(os.environ.get("STT_SILENCE_THRESHOLD_DB", "-40"))
         if strip_punctuation is None:
             strip_punctuation = os.environ.get("STT_STRIP_PUNCTUATION", "1") != "0"
+        if silence_flush_ms is None:
+            silence_flush_ms = int(os.environ.get("TTS_SILENCE_FLUSH_MS", "500"))
         
         STT_WINDOW_SIZE_SAMPLES = int(16000 * stt_window_ms / 1000)  # Dynamic window size
         STT_SAMPLE_RATE = 16000
@@ -464,6 +470,7 @@ class StreamingTTSService:
         
         audio_buffer = np.array([], dtype=np.int16)
         total_samples_processed = 0
+        silence_accum_ms = 0
         
         try:
             async for audio_chunk_bytes in audio_generator:
@@ -482,9 +489,15 @@ class StreamingTTSService:
                     # Skip silent frames (reduces spurious transcriptions and saves compute)
                     if is_silence(audio_float):
                         total_samples_processed += STT_WINDOW_SIZE_SAMPLES
+                        silence_accum_ms += stt_window_ms
                         print(f"[stt] Skipped silent frame at t={total_samples_processed/STT_SAMPLE_RATE:.2f}s")
                         emit("transcription_skipped_silence", timestamp_s=total_samples_processed/STT_SAMPLE_RATE)
+                        if silence_flush_event and silence_accum_ms >= silence_flush_ms:
+                            emit("transcription_silence_flush", silence_ms=silence_accum_ms)
+                            silence_flush_event.set()
+                            # keep accum until non-silence resets to avoid rapid re-trigger in same long silence
                         continue
+                    silence_accum_ms = 0
                     
                     # Transcribe this window
                     try:
@@ -522,6 +535,7 @@ class StreamingTTSService:
                 audio_float = audio_buffer.astype(np.float32) / 32768.0
                 # Skip final frame if it's silence
                 if not is_silence(audio_float):
+                    silence_accum_ms = 0
                     try:
                         segments, info = self.whisper_model.transcribe(
                             audio_float,
@@ -611,6 +625,7 @@ async def websocket_stream(ws: WebSocket) -> None:
         ws.query_params.get("tts_disable_batching"),
         os.environ.get("TTS_DISABLE_BATCHING", "0") != "0",
     )
+    tts_silence_flush_ms = int(ws.query_params.get("tts_silence_flush_ms", os.environ.get("TTS_SILENCE_FLUSH_MS", "500")))
     
     service: StreamingTTSService = app.state.tts_service
     tts_lock: asyncio.Lock = app.state.websocket_lock
@@ -620,6 +635,7 @@ async def websocket_stream(ws: WebSocket) -> None:
     audio_buffer = []  # retained for compatibility, no longer used for streaming
     audio_chunk_queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
     audio_done = asyncio.Event()  # signals client sent audio_end / websocket closed
+    silence_flush_event = asyncio.Event()
     stt_task = None
     tts_task = None
     text_queue = asyncio.Queue()
@@ -713,6 +729,8 @@ async def websocket_stream(ws: WebSocket) -> None:
                 stt_window_ms=stt_window_ms,
                 stt_silence_db=stt_silence_db,
                 strip_punctuation=stt_strip_punctuation,
+                silence_flush_event=silence_flush_event,
+                silence_flush_ms=tts_silence_flush_ms,
                 log_callback=enqueue_log
             )
 
@@ -794,7 +812,7 @@ async def websocket_stream(ws: WebSocket) -> None:
                         if not chunk_batch:
                             continue
                     else:
-                        # Adaptive batching mode (existing behavior)
+                        # Adaptive batching mode (existing behavior) with silence flush support
                         tts_buffer_start_time = asyncio.get_event_loop().time()
                         chunk_batch = ""
                         
@@ -827,6 +845,16 @@ async def websocket_stream(ws: WebSocket) -> None:
                             
                             chunk_batch += text_chunk + " "
                             
+                            # Check for silence-triggered flush
+                            if silence_flush_event.is_set() and chunk_batch.strip():
+                                enqueue_log(
+                                    "tts_silence_flush_trigger",
+                                    words=len(chunk_batch.split()),
+                                    elapsed_ms=(asyncio.get_event_loop().time() - tts_buffer_start_time) * 1000,
+                                )
+                                silence_flush_event.clear()
+                                break
+
                             # Check if we should start TTS generation now (adaptive trigger)
                             word_count = len(chunk_batch.split())
                             elapsed_ms = (asyncio.get_event_loop().time() - tts_buffer_start_time) * 1000
