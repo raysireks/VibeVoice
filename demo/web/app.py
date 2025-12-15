@@ -438,6 +438,7 @@ class StreamingTTSService:
                                 "is_final": False,
                                 "timestamp_ms": timestamp_ms,
                             }
+                            print(f"[stt_partial] t={timestamp_ms/1000:.2f}s text='{transcribed_text}'")
                             emit("transcription_partial", **result)
                             yield result
                     except Exception as e:
@@ -470,6 +471,7 @@ class StreamingTTSService:
                             "is_final": True,
                             "timestamp_ms": timestamp_ms,
                         }
+                        print(f"[stt_final] t={timestamp_ms/1000:.2f}s text='{transcribed_text}'")
                         emit("transcription_final", **result)
                         yield result
                 except Exception as e:
