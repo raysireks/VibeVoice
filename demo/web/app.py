@@ -135,24 +135,29 @@ class StreamingTTSService:
         # Lazy-load Whisper model for STT
         self._load_whisper()
 
-    def _load_whisper(self) -> None:
+    def _load_whisper(self, model_size: Optional[str] = None) -> None:
         """Lazy-load Faster Whisper model for speech-to-text."""
         if WhisperModel is None:
             print("[startup] Faster Whisper not installed. STT features unavailable.")
             return
         
         try:
-            print(f"[startup] Loading Faster Whisper model (large-v3) on device {self.stt_device}")
+            # Allow configurable Whisper model size via parameter or STT_MODEL_SIZE env var
+            # Options: tiny, base, small, medium, large, large-v3 (default)
+            if model_size is None:
+                model_size = os.environ.get("STT_MODEL_SIZE", "large-v3")
+            
+            print(f"[startup] Loading Faster Whisper model ({model_size}) on device {self.stt_device}")
             # Map TTS device names to Whisper compatible device strings
             whisper_device = "cuda" if self.stt_device == "cuda" else "cpu"
             compute_type = "float16" if whisper_device == "cuda" else "int8"
             
             self.whisper_model = WhisperModel(
-                model_size_or_path="large-v3",
+                model_size_or_path=model_size,
                 device=whisper_device,
                 compute_type=compute_type,
             )
-            print("[startup] Faster Whisper model loaded successfully")
+            print(f"[startup] Faster Whisper model ({model_size}) loaded successfully")
         except Exception as e:
             print(f"[startup] Failed to load Faster Whisper model: {e}")
             self.whisper_model = None
@@ -379,6 +384,8 @@ class StreamingTTSService:
         self,
         audio_generator: Any,  # async iterator of bytes
         log_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        stt_window_ms: Optional[int] = None,
+        stt_silence_db: Optional[float] = None,
     ) -> Iterator[Dict[str, Any]]:
         """
         Stream speech-to-text using Faster Whisper with partial transcriptions.
@@ -389,6 +396,8 @@ class StreamingTTSService:
         Args:
             audio_generator: Iterator yielding PCM16 bytes (16 kHz)
             log_callback: Optional callback for logging events
+            stt_window_ms: Optional window size in milliseconds (default 1000)
+            stt_silence_db: Optional silence threshold in dB (default -40)
             
         Yields:
             Dicts with keys: {'text': str, 'is_final': bool, 'timestamp_ms': float}
@@ -404,10 +413,13 @@ class StreamingTTSService:
                     print(f"[stt_callback] Error while emitting {event}: {exc}")
         
         # Audio buffer: accumulate 1.0 second at 16 kHz = 16,000 samples (reduced from 1.5s for lower latency)
-        STT_WINDOW_SIZE_MS = int(os.environ.get("STT_WINDOW_SIZE_MS", "1000"))
-        STT_WINDOW_SIZE_SAMPLES = int(16000 * STT_WINDOW_SIZE_MS / 1000)  # Dynamic window size
+        if stt_window_ms is None:
+            stt_window_ms = int(os.environ.get("STT_WINDOW_SIZE_MS", "1000"))
+        if stt_silence_db is None:
+            stt_silence_db = float(os.environ.get("STT_SILENCE_THRESHOLD_DB", "-40"))
+        
+        STT_WINDOW_SIZE_SAMPLES = int(16000 * stt_window_ms / 1000)  # Dynamic window size
         STT_SAMPLE_RATE = 16000
-        STT_SILENCE_THRESHOLD_DB = float(os.environ.get("STT_SILENCE_THRESHOLD_DB", "-40"))
         
         def is_silence(audio_float: np.ndarray) -> bool:
             """Check if audio window is below silence threshold using RMS energy."""
@@ -416,7 +428,7 @@ class StreamingTTSService:
             rms = np.sqrt(np.mean(audio_float ** 2))
             # Convert RMS to dB (20 * log10(rms))
             db = 20 * np.log10(rms + 1e-10)  # Add epsilon to avoid log(0)
-            return db < STT_SILENCE_THRESHOLD_DB
+            return db < stt_silence_db
         
         audio_buffer = np.array([], dtype=np.int16)
         total_samples_processed = 0
@@ -545,6 +557,15 @@ async def websocket_stream(ws: WebSocket) -> None:
     await ws.accept()
     text = ws.query_params.get("text", "")
     voice_param = ws.query_params.get("voice")
+    no_playback = ws.query_params.get("no_playback", "0") == "1"  # Echo cancellation: suppress TTS output during recording
+    mode = ws.query_params.get("mode", "text")
+    
+    # Parse configuration parameters from query params with fallback to environment variables
+    stt_window_ms = int(ws.query_params.get("stt_window_ms", os.environ.get("STT_WINDOW_SIZE_MS", "1000")))
+    stt_silence_db = float(ws.query_params.get("stt_silence_db", os.environ.get("STT_SILENCE_THRESHOLD_DB", "-40")))
+    stt_model_size = ws.query_params.get("stt_model_size", os.environ.get("STT_MODEL_SIZE", "large-v3"))
+    tts_min_words = int(ws.query_params.get("tts_min_words", os.environ.get("TTS_MIN_WORDS", "5")))
+    tts_buffer_ms = int(ws.query_params.get("tts_buffer_ms", os.environ.get("TTS_BUFFER_MS", "500")))
     
     service: StreamingTTSService = app.state.tts_service
     tts_lock: asyncio.Lock = app.state.websocket_lock
@@ -644,6 +665,8 @@ async def websocket_stream(ws: WebSocket) -> None:
 
             stt_gen = service.stream_stt(
                 audio_gen(),
+                stt_window_ms=stt_window_ms,
+                stt_silence_db=stt_silence_db,
                 log_callback=enqueue_log
             )
 
@@ -696,8 +719,8 @@ async def websocket_stream(ws: WebSocket) -> None:
                 enqueue_log("tts_started")
                 
                 accumulated_text = ""
-                tts_min_words = int(os.environ.get("TTS_MIN_WORDS", "5"))
-                tts_buffer_ms = int(os.environ.get("TTS_BUFFER_MS", "500"))
+                # Use configured values passed from query parameters
+                # (tts_min_words and tts_buffer_ms are already set from query params above)
                 
                 # Continuously process text chunks as they arrive from STT
                 first_ws_send_logged = False
@@ -934,6 +957,20 @@ async def websocket_stream(ws: WebSocket) -> None:
             # Audio input mode (STT + TTS)
             print("[mode] Audio-to-speech mode (STT + TTS)")
             stt_mode = True
+            
+            # Reload Whisper model if size has changed (for dynamic model selection)
+            current_model_size = None
+            if service.whisper_model is not None:
+                # Try to determine current model size from model config
+                try:
+                    current_model_size = getattr(service.whisper_model, 'model_size', None)
+                except Exception:
+                    pass
+            
+            if stt_model_size and stt_model_size != current_model_size:
+                print(f"[stt] Reloading Whisper model: {current_model_size} -> {stt_model_size}")
+                enqueue_log("whisper_model_change", from_model=current_model_size, to_model=stt_model_size)
+                service._load_whisper(model_size=stt_model_size)
             
             enqueue_log("ready_for_audio")
             await flush_logs()

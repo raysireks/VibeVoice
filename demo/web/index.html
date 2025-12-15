@@ -294,6 +294,63 @@
     margin-top: 0px;
   }
 
+  .advanced-settings-panel {
+    border: 1px solid rgba(85, 98, 255, 0.12);
+    border-radius: 14px;
+    padding: 18px 20px;
+    background: linear-gradient(135deg, #f8faff 0%, #f5f9ff 100%);
+  }
+
+  .settings-header {
+    cursor: pointer;
+    transition: opacity 0.2s;
+  }
+
+  .settings-header:hover {
+    opacity: 0.7;
+  }
+
+  .settings-toggle {
+    transition: transform 0.3s ease;
+    display: inline-block;
+  }
+
+  .settings-toggle.open {
+    transform: rotate(180deg);
+  }
+
+  .settings-content {
+    animation: slideDown 0.3s ease;
+  }
+
+  @keyframes slideDown {
+    from {
+      opacity: 0;
+      transform: translateY(-8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .settings-group {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .settings-group .range-control {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .settings-group .range-control span:first-child {
+    font-size: 14px;
+    font-weight: 500;
+    margin-bottom: 6px;
+  }
+
   @media (max-width: 720px) {
     .app-shell {
       padding: 28px 20px 36px;
@@ -405,6 +462,85 @@
       </div>
     </section>
 
+    <!-- Advanced Settings Section (Collapsible) -->
+    <section class="panel advanced-settings-panel">
+      <div class="settings-header" style="display: flex; justify-content: space-between; align-items: center; cursor: pointer; user-select: none;">
+        <span class="field-label" style="margin: 0;">⚙️ Advanced Settings</span>
+        <span class="settings-toggle" style="font-size: 14px; color: var(--text-muted);">▼</span>
+      </div>
+      
+      <div class="settings-content" style="display: none; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); flex-direction: column; gap: 16px;">
+        
+        <!-- STT Configuration -->
+        <div class="settings-group">
+          <h3 style="margin: 0 0 12px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.05em;">Speech-to-Text (STT)</h3>
+          
+          <label class="range-control">
+            <span>STT Window Size</span>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <input id="sttWindowMs" type="range" min="500" max="2000" step="100" value="1000" style="flex: 1;" />
+              <span class="range-value" id="sttWindowValue" style="min-width: 50px;">1000</span>
+              <span style="font-size: 12px; color: var(--text-muted);">ms</span>
+            </div>
+            <span class="helper-text">Lower = lower latency, higher = better accuracy. Default: 1000ms</span>
+          </label>
+
+          <label class="range-control">
+            <span>STT Silence Threshold</span>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <input id="sttSilenceDb" type="range" min="-60" max="-20" step="2" value="-40" style="flex: 1;" />
+              <span class="range-value" id="sttSilenceValue" style="min-width: 50px;">-40</span>
+              <span style="font-size: 12px; color: var(--text-muted);">dB</span>
+            </div>
+            <span class="helper-text">Skips transcription of silent frames below this threshold. Default: -40dB</span>
+          </label>
+
+          <label class="range-control">
+            <span>STT Model Size</span>
+            <select id="sttModelSize" class="select-control">
+              <option value="tiny">Tiny (39M) - Fastest</option>
+              <option value="base">Base (74M)</option>
+              <option value="small">Small (244M)</option>
+              <option value="medium">Medium (769M)</option>
+              <option value="large">Large (1.5B)</option>
+              <option value="large-v3" selected>Large-v3 (1.5B) - Most Accurate</option>
+            </select>
+            <span class="helper-text">Larger models are more accurate but slower. Changing requires model reload.</span>
+          </label>
+        </div>
+
+        <!-- TTS Configuration -->
+        <div class="settings-group">
+          <h3 style="margin: 0 0 12px 0; font-size: 13px; font-weight: 700; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.05em;">Text-to-Speech (TTS)</h3>
+          
+          <label class="range-control">
+            <span>TTS Min Words</span>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <input id="ttsMinWords" type="range" min="1" max="20" step="1" value="5" style="flex: 1;" />
+              <span class="range-value" id="ttsMinWordsValue" style="min-width: 30px;">5</span>
+              <span style="font-size: 12px; color: var(--text-muted);">words</span>
+            </div>
+            <span class="helper-text">Trigger TTS generation after this many words. Lower = lower latency. Default: 5</span>
+          </label>
+
+          <label class="range-control">
+            <span>TTS Buffer Time</span>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <input id="ttsBufferMs" type="range" min="200" max="2000" step="100" value="500" style="flex: 1;" />
+              <span class="range-value" id="ttsBufferValue" style="min-width: 50px;">500</span>
+              <span style="font-size: 12px; color: var(--text-muted);">ms</span>
+            </div>
+            <span class="helper-text">Max time to wait before triggering TTS. Lower = more responsive. Default: 500ms</span>
+          </label>
+        </div>
+
+        <!-- Restore Defaults Button -->
+        <div style="display: flex; gap: 8px;">
+          <button id="restoreDefaultSettings" type="button" class="secondary-btn" style="flex: 1;">Restore Defaults</button>
+        </div>
+      </div>
+    </section>
+
     <section class="panel">
       <div class="metrics">
         <span>Model Generated Audio<strong id="modelGenerated">0.00</strong><span class="metric-unit">s</span></span>
@@ -446,6 +582,75 @@
   const logOutput = document.getElementById('logOutput');
   const resetBtn = document.getElementById('resetControls');
   const saveBtn = document.getElementById('saveAudio');
+
+  // Advanced Settings Elements
+  const settingsHeader = document.querySelector('.settings-header');
+  const settingsContent = document.querySelector('.settings-content');
+  const settingsToggle = document.querySelector('.settings-toggle');
+  const sttWindowMsInput = document.getElementById('sttWindowMs');
+  const sttWindowValue = document.getElementById('sttWindowValue');
+  const sttSilenceDbInput = document.getElementById('sttSilenceDb');
+  const sttSilenceValue = document.getElementById('sttSilenceValue');
+  const sttModelSizeInput = document.getElementById('sttModelSize');
+  const ttsMinWordsInput = document.getElementById('ttsMinWords');
+  const ttsMinWordsValue = document.getElementById('ttsMinWordsValue');
+  const ttsBufferMsInput = document.getElementById('ttsBufferMs');
+  const ttsBufferValue = document.getElementById('ttsBufferValue');
+  const restoreDefaultSettingsBtn = document.getElementById('restoreDefaultSettings');
+
+  // Configuration Defaults
+  const CONFIG_DEFAULTS = {
+    stt_window_ms: 1000,
+    stt_silence_db: -40,
+    stt_model_size: 'large-v3',
+    tts_min_words: 5,
+    tts_buffer_ms: 500,
+  };
+
+  // Load configuration from localStorage or use defaults
+  const loadConfig = () => {
+    const config = { ...CONFIG_DEFAULTS };
+    for (const key in CONFIG_DEFAULTS) {
+      const stored = localStorage.getItem(`vibevoice_${key}`);
+      if (stored !== null) {
+        config[key] = isNaN(stored) ? stored : parseFloat(stored);
+      }
+    }
+    return config;
+  };
+
+  // Save configuration to localStorage
+  const saveConfig = (config) => {
+    for (const key in config) {
+      localStorage.setItem(`vibevoice_${key}`, config[key]);
+    }
+  };
+
+  // Get current configuration from UI inputs
+  const getCurrentConfig = () => ({
+    stt_window_ms: parseInt(sttWindowMsInput.value),
+    stt_silence_db: parseInt(sttSilenceDbInput.value),
+    stt_model_size: sttModelSizeInput.value,
+    tts_min_words: parseInt(ttsMinWordsInput.value),
+    tts_buffer_ms: parseInt(ttsBufferMsInput.value),
+  });
+
+  // Update UI inputs from configuration
+  const applyConfigToUI = (config) => {
+    sttWindowMsInput.value = config.stt_window_ms;
+    sttWindowValue.textContent = config.stt_window_ms;
+    sttSilenceDbInput.value = config.stt_silence_db;
+    sttSilenceValue.textContent = config.stt_silence_db;
+    sttModelSizeInput.value = config.stt_model_size;
+    ttsMinWordsInput.value = config.tts_min_words;
+    ttsMinWordsValue.textContent = config.tts_min_words;
+    ttsBufferMsInput.value = config.tts_buffer_ms;
+    ttsBufferValue.textContent = config.tts_buffer_ms;
+  };
+
+  // Initialize settings from localStorage
+  let currentConfig = loadConfig();
+  applyConfigToUI(currentConfig);
 
   let playbackTimer = null;
   let lastPlaybackElapsed = 0;
@@ -750,6 +955,61 @@
     appendLog('[Frontend] Controls reset to defaults (CFG=1.5, Steps=5)');
   });
 
+  // Advanced Settings Event Listeners
+  settingsHeader.addEventListener('click', () => {
+    const isOpen = settingsContent.style.display !== 'none';
+    if (isOpen) {
+      settingsContent.style.display = 'none';
+      settingsToggle.classList.remove('open');
+    } else {
+      settingsContent.style.display = 'flex';
+      settingsToggle.classList.add('open');
+    }
+  });
+
+  // STT Window Size slider
+  sttWindowMsInput.addEventListener('input', () => {
+    sttWindowValue.textContent = sttWindowMsInput.value;
+    currentConfig.stt_window_ms = parseInt(sttWindowMsInput.value);
+    saveConfig(currentConfig);
+  });
+
+  // STT Silence Threshold slider
+  sttSilenceDbInput.addEventListener('input', () => {
+    sttSilenceValue.textContent = sttSilenceDbInput.value;
+    currentConfig.stt_silence_db = parseInt(sttSilenceDbInput.value);
+    saveConfig(currentConfig);
+  });
+
+  // STT Model Size dropdown
+  sttModelSizeInput.addEventListener('change', () => {
+    currentConfig.stt_model_size = sttModelSizeInput.value;
+    saveConfig(currentConfig);
+    appendLog(`[Frontend] STT Model Size changed to ${sttModelSizeInput.value} - will apply on next connection`);
+  });
+
+  // TTS Min Words slider
+  ttsMinWordsInput.addEventListener('input', () => {
+    ttsMinWordsValue.textContent = ttsMinWordsInput.value;
+    currentConfig.tts_min_words = parseInt(ttsMinWordsInput.value);
+    saveConfig(currentConfig);
+  });
+
+  // TTS Buffer Time slider
+  ttsBufferMsInput.addEventListener('input', () => {
+    ttsBufferValue.textContent = ttsBufferMsInput.value;
+    currentConfig.tts_buffer_ms = parseInt(ttsBufferMsInput.value);
+    saveConfig(currentConfig);
+  });
+
+  // Restore Defaults button
+  restoreDefaultSettingsBtn.addEventListener('click', () => {
+    currentConfig = { ...CONFIG_DEFAULTS };
+    applyConfigToUI(currentConfig);
+    saveConfig(currentConfig);
+    appendLog('[Frontend] Advanced settings restored to defaults');
+  });
+
   if (promptInput) {
     promptInput.addEventListener('input', () => {
       if (previewActive) {
@@ -993,6 +1253,12 @@
     if (voiceValue) {
       params.set('voice', voiceValue);
     }
+    // Add advanced configuration parameters
+    params.set('stt_window_ms', currentConfig.stt_window_ms);
+    params.set('stt_silence_db', currentConfig.stt_silence_db);
+    params.set('stt_model_size', currentConfig.stt_model_size);
+    params.set('tts_min_words', currentConfig.tts_min_words);
+    params.set('tts_buffer_ms', currentConfig.tts_buffer_ms);
     const wsUrl = `${location.origin.replace(/^http/, 'ws')}/stream?${params.toString()}`;
 
     socket = new WebSocket(wsUrl);
@@ -1229,6 +1495,12 @@
       if (voiceValue) {
         params.set('voice', voiceValue);
       }
+      // Add advanced configuration parameters
+      params.set('stt_window_ms', currentConfig.stt_window_ms);
+      params.set('stt_silence_db', currentConfig.stt_silence_db);
+      params.set('stt_model_size', currentConfig.stt_model_size);
+      params.set('tts_min_words', currentConfig.tts_min_words);
+      params.set('tts_buffer_ms', currentConfig.tts_buffer_ms);
       const wsUrl = `${location.origin.replace(/^http/, 'ws')}/stream?${params.toString()}`;
       
       // Create WebSocket first, then set up playback with reference to it
