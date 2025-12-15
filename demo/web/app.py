@@ -696,7 +696,6 @@ async def websocket_stream(ws: WebSocket) -> None:
                 enqueue_log("tts_started")
                 
                 accumulated_text = ""
-                stop_signal = threading.Event()
                 tts_min_words = int(os.environ.get("TTS_MIN_WORDS", "5"))
                 tts_buffer_ms = int(os.environ.get("TTS_BUFFER_MS", "500"))
                 
@@ -759,6 +758,9 @@ async def websocket_stream(ws: WebSocket) -> None:
                             cfg_scale=cfg_scale,
                             inference_steps=inference_steps,
                         )
+                        
+                        # Create fresh stop_signal for this batch (prevents reuse across batches)
+                        stop_signal = threading.Event()
                         
                         try:
                             iterator = streaming_tts(
