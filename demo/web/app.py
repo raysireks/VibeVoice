@@ -244,6 +244,7 @@ class StreamingTTSService:
         stop_event: threading.Event,
     ) -> None:
         try:
+            print(f"[_run_generation] Starting model.generate() with cfg_scale={cfg_scale}")
             self.model.generate(
                 **inputs,
                 max_new_tokens=None,
@@ -260,7 +261,9 @@ class StreamingTTSService:
                 refresh_negative=refresh_negative,
                 all_prefilled_outputs=copy.deepcopy(prefilled_outputs),
             )
+            print(f"[_run_generation] model.generate() completed successfully")
         except Exception as exc:  # pragma: no cover - diagnostic logging
+            print(f"[_run_generation] ERROR in model.generate(): {exc}")
             errors.append(exc)
             traceback.print_exc()
             audio_streamer.end()
@@ -278,9 +281,11 @@ class StreamingTTSService:
         log_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         stop_event: Optional[threading.Event] = None,
     ) -> Iterator[np.ndarray]:
+        print(f"[stream] Called with text='{text}', voice_key={voice_key}, cfg_scale={cfg_scale}")
         if not text.strip():
+            print(f"[stream] Empty text, returning empty iterator")
             return
-        text = text.replace("’", "'")
+        text = text.replace("'", "'")
         selected_voice, prefilled_outputs = self._get_voice_resources(voice_key)
 
         def emit(event: str, **payload: Any) -> None:
@@ -750,21 +755,35 @@ async def websocket_stream(ws: WebSocket) -> None:
                             inference_steps=inference_steps,
                         )
                         
-                        iterator = streaming_tts(
-                            chunk_batch,
-                            cfg_scale=cfg_scale,
-                            inference_steps=inference_steps,
-                            voice_key=voice_param,
-                            log_callback=enqueue_log,
-                            stop_event=stop_signal,
-                        )
+                        try:
+                            iterator = streaming_tts(
+                                chunk_batch,
+                                cfg_scale=cfg_scale,
+                                inference_steps=inference_steps,
+                                voice_key=voice_param,
+                                log_callback=enqueue_log,
+                                stop_event=stop_signal,
+                            )
+                        except Exception as e:
+                            print(f"[tts_task] ERROR creating TTS iterator: {e}")
+                            traceback.print_exc()
+                            enqueue_log("tts_iterator_error", message=str(e))
+                            continue  # Skip this batch and continue with next
+                        
                         sentinel = object()
                         
                         chunk_count = 0
                         try:
                             while ws.client_state == WebSocketState.CONNECTED:
                                 await flush_logs()
-                                chunk = await asyncio.to_thread(next, iterator, sentinel)
+                                try:
+                                    chunk = await asyncio.to_thread(next, iterator, sentinel)
+                                except Exception as e:
+                                    print(f"[tts_task] ERROR getting next chunk: {e}")
+                                    traceback.print_exc()
+                                    enqueue_log("tts_chunk_error", message=str(e))
+                                    break
+                                
                                 if chunk is sentinel:
                                     print(f"[tts_task] TTS generation complete - sent {chunk_count} audio chunks")
                                     break
