@@ -1262,9 +1262,17 @@
               const { event: logEvent, data = {}, timestamp } = payload;
               switch (logEvent) {
                 case 'transcription_partial':
-                case 'transcription_update':
-                  transcriptionPreview.textContent = data.text || '';
+                  // Show individual transcription chunks as they arrive
+                  const partialText = data.text || '';
+                  if (partialText) {
+                    transcriptionPreview.textContent += partialText + ' ';
+                  }
                   transcriptionStatus.textContent = `Transcribing: ${(data.timestamp_ms / 1000).toFixed(1)}s`;
+                  break;
+                case 'transcription_update':
+                  // Full accumulated text update
+                  transcriptionPreview.textContent = data.text || '';
+                  transcriptionStatus.textContent = `Transcribing: ${data.is_final ? 'complete' : 'in progress'}`;
                   break;
                 case 'transcription_final':
                   transcriptionPreview.textContent = data.text || '';

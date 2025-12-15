@@ -687,86 +687,103 @@ async def websocket_stream(ws: WebSocket) -> None:
                 
                 accumulated_text = ""
                 stop_signal = threading.Event()
-                tts_buffer_start_time = None
                 tts_min_words = int(os.environ.get("TTS_MIN_WORDS", "5"))
                 tts_buffer_ms = int(os.environ.get("TTS_BUFFER_MS", "500"))
                 
-                # Accumulate text from queue with adaptive trigger: start TTS after >=MIN_WORDS or BUFFER_MS elapsed
+                # Continuously process text chunks as they arrive from STT
+                first_ws_send_logged = False
                 while True:
-                    try:
-                        # Use longer timeout to wait for audio_done signal instead of giving up after 2s
-                        text_chunk = await asyncio.wait_for(text_queue.get(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        # 5s timeout indicates network stall or STT failure
-                        print("[tts_task] Timeout waiting for text (5s) - STT may have stalled")
-                        enqueue_log("tts_timeout_waiting_for_text")
-                        break
+                    # Accumulate text until adaptive trigger threshold
+                    tts_buffer_start_time = asyncio.get_event_loop().time()
+                    chunk_batch = ""
                     
-                    if text_chunk is None:
-                        # STT stream complete - process accumulated text and exit
-                        print("[tts_task] STT complete signal received (None)")
-                        break
-                    
-                    accumulated_text += text_chunk + " "
-                    
-                    # Track time since first text arrived
-                    if tts_buffer_start_time is None:
-                        tts_buffer_start_time = asyncio.get_event_loop().time()
-                    
-                    # Check if we should start TTS generation now (adaptive trigger)
-                    word_count = len(accumulated_text.split())
-                    elapsed_ms = (asyncio.get_event_loop().time() - tts_buffer_start_time) * 1000
-                    
-                    if word_count >= tts_min_words or elapsed_ms >= tts_buffer_ms:
-                        print(f"[tts_task] TTS trigger: words={word_count}, elapsed_ms={elapsed_ms:.0f}")
-                        enqueue_log("tts_buffer_trigger", words=word_count, elapsed_ms=elapsed_ms, threshold_words=tts_min_words, threshold_ms=tts_buffer_ms)
-                        break  # Start TTS generation with accumulated text
-                
-                if accumulated_text.strip():
-                    enqueue_log(
-                        "tts_generating",
-                        text_length=len(accumulated_text),
-                        word_count=len(accumulated_text.split()),
-                        cfg_scale=cfg_scale,
-                        inference_steps=inference_steps,
-                    )
-                    
-                    iterator = streaming_tts(
-                        accumulated_text,
-                        cfg_scale=cfg_scale,
-                        inference_steps=inference_steps,
-                        voice_key=voice_param,
-                        log_callback=enqueue_log,
-                        stop_event=stop_signal,
-                    )
-                    sentinel = object()
-                    first_ws_send_logged = False
-                    
-                    try:
-                        while ws.client_state == WebSocketState.CONNECTED:
-                            await flush_logs()
-                            chunk = await asyncio.to_thread(next, iterator, sentinel)
-                            if chunk is sentinel:
-                                break
-                            chunk = cast(np.ndarray, chunk)
-                            payload = service.chunk_to_pcm16(chunk)
-                            await ws.send_bytes(payload)
-                            if not first_ws_send_logged:
-                                first_ws_send_logged = True
-                                enqueue_log("backend_first_chunk_sent")
-                            await flush_logs()
-                    except WebSocketDisconnect:
-                        print("Client disconnected during TTS")
-                        enqueue_log("client_disconnected")
-                        stop_signal.set()
-                    finally:
-                        stop_signal.set()
+                    while True:
                         try:
-                            iterator_close = getattr(iterator, "close", None)
-                            if callable(iterator_close):
-                                iterator_close()
-                        except Exception:
-                            pass
+                            # Use longer timeout to wait for audio_done signal instead of giving up after 2s
+                            text_chunk = await asyncio.wait_for(text_queue.get(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            # 5s timeout - if we have accumulated text, process it; otherwise exit
+                            if chunk_batch.strip():
+                                print("[tts_task] Timeout waiting for more text, processing buffered text")
+                                enqueue_log("tts_timeout_processing_buffer", text_length=len(chunk_batch))
+                                break
+                            else:
+                                print("[tts_task] Timeout waiting for text (5s) with no buffer - STT may have stalled")
+                                enqueue_log("tts_timeout_waiting_for_text")
+                                enqueue_log("tts_completed")
+                                return
+                        
+                        if text_chunk is None:
+                            # STT stream complete - process final accumulated text and exit
+                            print(f"[tts_task] STT complete signal received. Final batch: '{chunk_batch}'")
+                            if chunk_batch.strip():
+                                break  # Process final batch
+                            else:
+                                enqueue_log("tts_completed")
+                                return
+                        
+                        chunk_batch += text_chunk + " "
+                        
+                        # Check if we should start TTS generation now (adaptive trigger)
+                        word_count = len(chunk_batch.split())
+                        elapsed_ms = (asyncio.get_event_loop().time() - tts_buffer_start_time) * 1000
+                        
+                        if word_count >= tts_min_words or elapsed_ms >= tts_buffer_ms:
+                            print(f"[tts_task] TTS trigger: words={word_count}, elapsed_ms={elapsed_ms:.0f}")
+                            enqueue_log("tts_buffer_trigger", words=word_count, elapsed_ms=elapsed_ms, threshold_words=tts_min_words, threshold_ms=tts_buffer_ms)
+                            break  # Start TTS generation with this batch
+                    
+                    # Generate TTS for this batch
+                    if chunk_batch.strip():
+                        accumulated_text += chunk_batch
+                        enqueue_log(
+                            "tts_generating",
+                            text_length=len(chunk_batch),
+                            word_count=len(chunk_batch.split()),
+                            total_text_length=len(accumulated_text),
+                            cfg_scale=cfg_scale,
+                            inference_steps=inference_steps,
+                        )
+                        
+                        iterator = streaming_tts(
+                            chunk_batch,
+                            cfg_scale=cfg_scale,
+                            inference_steps=inference_steps,
+                            voice_key=voice_param,
+                            log_callback=enqueue_log,
+                            stop_event=stop_signal,
+                        )
+                        sentinel = object()
+                        
+                        try:
+                            while ws.client_state == WebSocketState.CONNECTED:
+                                await flush_logs()
+                                chunk = await asyncio.to_thread(next, iterator, sentinel)
+                                if chunk is sentinel:
+                                    break
+                                chunk = cast(np.ndarray, chunk)
+                                payload = service.chunk_to_pcm16(chunk)
+                                await ws.send_bytes(payload)
+                                if not first_ws_send_logged:
+                                    first_ws_send_logged = True
+                                    enqueue_log("backend_first_chunk_sent")
+                                await flush_logs()
+                        except WebSocketDisconnect:
+                            print("Client disconnected during TTS")
+                            enqueue_log("client_disconnected")
+                            stop_signal.set()
+                            return
+                        finally:
+                            try:
+                                iterator_close = getattr(iterator, "close", None)
+                                if callable(iterator_close):
+                                    iterator_close()
+                            except Exception:
+                                pass
+                        
+                        # Check if we should continue (look for more text or exit)
+                        if text_chunk is None:  # Was None sentinel - STT complete
+                            break
                 
                 enqueue_log("tts_completed")
         
