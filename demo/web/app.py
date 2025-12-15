@@ -692,6 +692,8 @@ async def websocket_stream(ws: WebSocket) -> None:
                 
                 # Continuously process text chunks as they arrive from STT
                 first_ws_send_logged = False
+                stt_complete = False  # Track if STT has signaled completion
+                
                 while True:
                     # Accumulate text until adaptive trigger threshold
                     tts_buffer_start_time = asyncio.get_event_loop().time()
@@ -699,23 +701,25 @@ async def websocket_stream(ws: WebSocket) -> None:
                     
                     while True:
                         try:
-                            # Use longer timeout to wait for audio_done signal instead of giving up after 2s
-                            text_chunk = await asyncio.wait_for(text_queue.get(), timeout=5.0)
+                            # Wait for text from STT queue (no timeout - wait indefinitely until STT completes)
+                            text_chunk = await text_queue.get()
                         except asyncio.TimeoutError:
-                            # 5s timeout - if we have accumulated text, process it; otherwise exit
+                            # This should not happen with no timeout, but handle gracefully
                             if chunk_batch.strip():
                                 print("[tts_task] Timeout waiting for more text, processing buffered text")
                                 enqueue_log("tts_timeout_processing_buffer", text_length=len(chunk_batch))
                                 break
                             else:
-                                print("[tts_task] Timeout waiting for text (5s) with no buffer - STT may have stalled")
-                                enqueue_log("tts_timeout_waiting_for_text")
+                                # Should never reach here - no timeout set
+                                print("[tts_task] Unexpected timeout")
+                                enqueue_log("tts_unexpected_timeout")
                                 enqueue_log("tts_completed")
                                 return
                         
                         if text_chunk is None:
                             # STT stream complete - process final accumulated text and exit
                             print(f"[tts_task] STT complete signal received. Final batch: '{chunk_batch}'")
+                            stt_complete = True
                             if chunk_batch.strip():
                                 break  # Process final batch
                             else:
@@ -780,10 +784,11 @@ async def websocket_stream(ws: WebSocket) -> None:
                                     iterator_close()
                             except Exception:
                                 pass
-                        
-                        # Check if we should continue (look for more text or exit)
-                        if text_chunk is None:  # Was None sentinel - STT complete
-                            break
+                    
+                    # Check if we should continue (look for more text or exit)
+                    if stt_complete:  # STT signaled completion - exit after processing final batch
+                        print("[tts_task] STT complete - exiting TTS loop")
+                        break
                 
                 enqueue_log("tts_completed")
         
