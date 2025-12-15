@@ -24,6 +24,11 @@ from vibevoice.processor.vibevoice_streaming_processor import (
 )
 from vibevoice.modular.streamer import AudioStreamer
 
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
+
 import copy
 
 BASE = Path(__file__).parent
@@ -55,6 +60,10 @@ class StreamingTTSService:
         self.voice_presets: Dict[str, Path] = {}
         self.default_voice_key: Optional[str] = None
         self._voice_cache: Dict[str, Tuple[object, Path, str]] = {}
+        
+        # STT (Faster Whisper) components
+        self.whisper_model: Optional[Any] = None  # WhisperModel instance
+        self.stt_device = device  # Use same device as TTS
 
         if device == "mpx":
             print("Note: device 'mpx' detected, treating it as 'mps'.")
@@ -122,6 +131,31 @@ class StreamingTTSService:
         preset_name = os.environ.get("VOICE_PRESET")
         self.default_voice_key = self._determine_voice_key(preset_name)
         self._ensure_voice_cached(self.default_voice_key)
+        
+        # Lazy-load Whisper model for STT
+        self._load_whisper()
+
+    def _load_whisper(self) -> None:
+        """Lazy-load Faster Whisper model for speech-to-text."""
+        if WhisperModel is None:
+            print("[startup] Faster Whisper not installed. STT features unavailable.")
+            return
+        
+        try:
+            print(f"[startup] Loading Faster Whisper model (large-v3) on device {self.stt_device}")
+            # Map TTS device names to Whisper compatible device strings
+            whisper_device = "cuda" if self.stt_device == "cuda" else "cpu"
+            compute_type = "float16" if whisper_device == "cuda" else "int8"
+            
+            self.whisper_model = WhisperModel(
+                model_size_or_path="large-v3",
+                device=whisper_device,
+                compute_type=compute_type,
+            )
+            print("[startup] Faster Whisper model loaded successfully")
+        except Exception as e:
+            print(f"[startup] Failed to load Faster Whisper model: {e}")
+            self.whisper_model = None
 
     def _load_voice_presets(self) -> Dict[str, Path]:
         voices_dir = BASE.parent / "voices" / "streaming_model"
@@ -331,8 +365,119 @@ class StreamingTTSService:
         pcm = (chunk * 32767.0).astype(np.int16)
         return pcm.tobytes()
 
+    async def stream_stt(
+        self,
+        audio_generator: Iterator[bytes],
+        log_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        Stream speech-to-text using Faster Whisper with partial transcriptions.
+        
+        Audio is expected as PCM16 bytes at 16 kHz sample rate.
+        Yields partial transcription dictionaries as audio is buffered and processed.
+        
+        Args:
+            audio_generator: Iterator yielding PCM16 bytes (16 kHz)
+            log_callback: Optional callback for logging events
+            
+        Yields:
+            Dicts with keys: {'text': str, 'is_final': bool, 'timestamp_ms': float}
+        """
+        if not self.whisper_model:
+            raise RuntimeError("Faster Whisper model not loaded")
+        
+        def emit(event: str, **payload: Any) -> None:
+            if log_callback:
+                try:
+                    log_callback(event, **payload)
+                except Exception as exc:
+                    print(f"[stt_callback] Error while emitting {event}: {exc}")
+        
+        # Audio buffer: accumulate 1.5 seconds at 16 kHz = 24,000 samples
+        STT_WINDOW_SIZE_SAMPLES = 24000  # 1.5 seconds at 16 kHz
+        STT_SAMPLE_RATE = 16000
+        
+        audio_buffer = np.array([], dtype=np.int16)
+        total_samples_processed = 0
+        
+        try:
+            for audio_chunk_bytes in audio_generator:
+                # Convert PCM16 bytes to int16 numpy array
+                chunk = np.frombuffer(audio_chunk_bytes, dtype=np.int16)
+                audio_buffer = np.concatenate([audio_buffer, chunk])
+                
+                # When buffer reaches target size, transcribe
+                while len(audio_buffer) >= STT_WINDOW_SIZE_SAMPLES:
+                    window = audio_buffer[:STT_WINDOW_SIZE_SAMPLES]
+                    audio_buffer = audio_buffer[STT_WINDOW_SIZE_SAMPLES:]
+                    
+                    # Convert to float32 in range [-1, 1] for Whisper
+                    audio_float = window.astype(np.float32) / 32768.0
+                    
+                    # Transcribe this window
+                    try:
+                        segments, info = self.whisper_model.transcribe(
+                            audio_float,
+                            language="en",
+                            beam_size=5,
+                            vad_filter=False,  # Explicit control - no VAD
+                            condition_on_previous_text=False,
+                        )
+                        
+                        transcribed_text = ""
+                        for segment in segments:
+                            transcribed_text += segment.text + " "
+                        
+                        transcribed_text = transcribed_text.strip()
+                        if transcribed_text:
+                            total_samples_processed += STT_WINDOW_SIZE_SAMPLES
+                            timestamp_ms = (total_samples_processed / STT_SAMPLE_RATE) * 1000
+                            
+                            result = {
+                                "text": transcribed_text,
+                                "is_final": False,
+                                "timestamp_ms": timestamp_ms,
+                            }
+                            emit("transcription_partial", **result)
+                            yield result
+                    except Exception as e:
+                        print(f"[stt] Transcription error: {e}")
+                        emit("transcription_error", message=str(e))
+                        
+        except GeneratorExit:
+            # Handle remaining audio in buffer when stream ends
+            if len(audio_buffer) > 0:
+                audio_float = audio_buffer.astype(np.float32) / 32768.0
+                try:
+                    segments, info = self.whisper_model.transcribe(
+                        audio_float,
+                        language="en",
+                        beam_size=5,
+                        vad_filter=False,
+                        condition_on_previous_text=False,
+                    )
+                    
+                    transcribed_text = ""
+                    for segment in segments:
+                        transcribed_text += segment.text + " "
+                    
+                    transcribed_text = transcribed_text.strip()
+                    if transcribed_text:
+                        total_samples_processed += len(audio_buffer)
+                        timestamp_ms = (total_samples_processed / STT_SAMPLE_RATE) * 1000
+                        
+                        result = {
+                            "text": transcribed_text,
+                            "is_final": True,
+                            "timestamp_ms": timestamp_ms,
+                        }
+                        emit("transcription_final", **result)
+                        yield result
+                except Exception as e:
+                    print(f"[stt] Final transcription error: {e}")
+                    emit("transcription_error", message=str(e))
 
-app = FastAPI()
+
 
 
 @app.on_event("startup")
@@ -364,131 +509,350 @@ def streaming_tts(text: str, **kwargs) -> Iterator[np.ndarray]:
 async def websocket_stream(ws: WebSocket) -> None:
     await ws.accept()
     text = ws.query_params.get("text", "")
-    print(f"Client connected, text={text!r}")
-    cfg_param = ws.query_params.get("cfg")
-    steps_param = ws.query_params.get("steps")
     voice_param = ws.query_params.get("voice")
-
-    try:
-        cfg_scale = float(cfg_param) if cfg_param is not None else 1.5
-    except ValueError:
-        cfg_scale = 1.5
-    if cfg_scale <= 0:
-        cfg_scale = 1.5
-    try:
-        inference_steps = int(steps_param) if steps_param is not None else None
-        if inference_steps is not None and inference_steps <= 0:
-            inference_steps = None
-    except ValueError:
-        inference_steps = None
-
+    
     service: StreamingTTSService = app.state.tts_service
-    lock: asyncio.Lock = app.state.websocket_lock
-
-    if lock.locked():
-        busy_message = {
-            "type": "log",
-            "event": "backend_busy",
-            "data": {"message": "Please wait for the other requests to complete."},
-            "timestamp": get_timestamp(),
-        }
-        print("Please wait for the other requests to complete.")
-        try:
-            await ws.send_text(json.dumps(busy_message))
-        except Exception:
-            pass
-        await ws.close(code=1013, reason="Service busy")
-        return
-
-    acquired = False
-    try:
-        await lock.acquire()
-        acquired = True
-
-        log_queue: "Queue[Dict[str, Any]]" = Queue()
-
-        def enqueue_log(event: str, **data: Any) -> None:
-            log_queue.put({"event": event, "data": data})
-
-        async def flush_logs() -> None:
-            while True:
-                try:
-                    entry = log_queue.get_nowait()
-                except Empty:
-                    break
-                message = {
-                    "type": "log",
-                    "event": entry.get("event"),
-                    "data": entry.get("data", {}),
-                    "timestamp": get_timestamp(),
-                }
-                try:
-                    await ws.send_text(json.dumps(message))
-                except Exception:
-                    break
-
-        enqueue_log(
-            "backend_request_received",
-            text_length=len(text or ""),
-            cfg_scale=cfg_scale,
-            inference_steps=inference_steps,
-            voice=voice_param,
-        )
-
-        stop_signal = threading.Event()
-
-        iterator = streaming_tts(
-            text,
-            cfg_scale=cfg_scale,
-            inference_steps=inference_steps,
-            voice_key=voice_param,
-            log_callback=enqueue_log,
-            stop_event=stop_signal,
-        )
-        sentinel = object()
-        first_ws_send_logged = False
-
-        await flush_logs()
-
+    tts_lock: asyncio.Lock = app.state.websocket_lock
+    
+    # Separate lock for STT to allow concurrent streams
+    stt_mode = False
+    audio_buffer = []
+    stt_task = None
+    tts_task = None
+    text_queue = asyncio.Queue()
+    
+    log_queue: "Queue[Dict[str, Any]]" = Queue()
+    
+    def enqueue_log(event: str, **data: Any) -> None:
+        log_queue.put({"event": event, "data": data})
+    
+    async def flush_logs() -> None:
+        while True:
+            try:
+                entry = log_queue.get_nowait()
+            except Empty:
+                break
+            message = {
+                "type": "log",
+                "event": entry.get("event"),
+                "data": entry.get("data", {}),
+                "timestamp": get_timestamp(),
+            }
+            try:
+                await ws.send_text(json.dumps(message))
+            except Exception:
+                break
+    
+    async def handle_audio_stream() -> None:
+        """Handle incoming audio chunks and feed to STT."""
         try:
             while ws.client_state == WebSocketState.CONNECTED:
-                await flush_logs()
-                chunk = await asyncio.to_thread(next, iterator, sentinel)
-                if chunk is sentinel:
-                    break
-                chunk = cast(np.ndarray, chunk)
-                payload = service.chunk_to_pcm16(chunk)
-                await ws.send_bytes(payload)
-                if not first_ws_send_logged:
-                    first_ws_send_logged = True
-                    enqueue_log("backend_first_chunk_sent")
-                await flush_logs()
-        except WebSocketDisconnect:
-            print("Client disconnected (WebSocketDisconnect)")
-            enqueue_log("client_disconnected")
-            stop_signal.set()
-        finally:
-            stop_signal.set()
-            enqueue_log("backend_stream_complete")
-            await flush_logs()
-            try:
-                iterator_close = getattr(iterator, "close", None)
-                if callable(iterator_close):
-                    iterator_close()
-            except Exception:
-                pass
-            # clear the log queue
-            while not log_queue.empty():
                 try:
-                    log_queue.get_nowait()
-                except Empty:
+                    # Receive audio chunk with timeout
+                    message = await asyncio.wait_for(ws.receive(), timeout=30.0)
+                    
+                    if message.get("type") == "binary":
+                        # Audio data chunk
+                        audio_buffer.append(message.get("bytes"))
+                    elif message.get("type") == "text":
+                        # Handle text messages (control signals)
+                        try:
+                            data = json.loads(message.get("text", "{}"))
+                            msg_type = data.get("type")
+                            
+                            if msg_type == "audio_end":
+                                print("[audio] Client signaled end of audio stream")
+                                enqueue_log("audio_stream_ended")
+                                break
+                            elif msg_type == "voice_change":
+                                new_voice = data.get("voice")
+                                enqueue_log("voice_changed", voice=new_voice)
+                        except json.JSONDecodeError:
+                            pass
+                except asyncio.TimeoutError:
+                    print("[audio] Timeout waiting for audio data")
+                    enqueue_log("audio_timeout")
                     break
+                except Exception as e:
+                    print(f"[audio] Error receiving data: {e}")
+                    break
+        except Exception as e:
+            print(f"[audio_stream] Error: {e}")
+        finally:
+            enqueue_log("audio_reception_complete")
+    
+    async def run_stt() -> None:
+        """Run STT on buffered audio and feed to TTS."""
+        try:
+            # Concatenate all audio chunks
+            if not audio_buffer:
+                print("[stt] No audio data received")
+                await text_queue.put(None)  # Signal completion
+                return
+            
+            full_audio = b"".join(audio_buffer)
+            
+            # Create generator from audio bytes
+            def audio_gen():
+                # Yield in small chunks to simulate streaming
+                chunk_size = 3200  # 200ms at 16kHz
+                for i in range(0, len(full_audio), chunk_size):
+                    yield full_audio[i:i+chunk_size]
+            
+            # Run STT with streaming
+            enqueue_log("stt_started")
+            transcribed_text = ""
+            
+            stt_gen = service.stream_stt(
+                audio_gen(),
+                log_callback=enqueue_log
+            )
+            
+            for result in stt_gen:
+                text = result.get("text", "").strip()
+                is_final = result.get("is_final", False)
+                
+                if text:
+                    transcribed_text += text + " "
+                    # Queue text for TTS processing
+                    await text_queue.put(text)
+                    enqueue_log("transcription_update", text=transcribed_text.strip(), is_final=is_final)
+            
+            # Signal that STT is complete
+            await text_queue.put(None)
+            enqueue_log("stt_completed")
+            
+        except Exception as e:
+            print(f"[stt_task] Error: {e}")
+            enqueue_log("stt_error", message=str(e))
+            await text_queue.put(None)
+    
+    async def run_tts_from_queue() -> None:
+        """Read text from queue and generate TTS."""
+        try:
+            cfg_param = ws.query_params.get("cfg")
+            steps_param = ws.query_params.get("steps")
+            
+            try:
+                cfg_scale = float(cfg_param) if cfg_param else 1.5
+            except (ValueError, TypeError):
+                cfg_scale = 1.5
+            if cfg_scale <= 0:
+                cfg_scale = 1.5
+            
+            try:
+                inference_steps = int(steps_param) if steps_param else None
+                if inference_steps is not None and inference_steps <= 0:
+                    inference_steps = None
+            except (ValueError, TypeError):
+                inference_steps = None
+            
+            # Acquire TTS lock only when generating
+            async with tts_lock:
+                enqueue_log("tts_started")
+                
+                accumulated_text = ""
+                stop_signal = threading.Event()
+                
+                # Accumulate text from queue
+                while True:
+                    try:
+                        text_chunk = await asyncio.wait_for(text_queue.get(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        break
+                    
+                    if text_chunk is None:
+                        break  # STT stream complete
+                    
+                    accumulated_text += text_chunk + " "
+                
+                if accumulated_text.strip():
+                    enqueue_log(
+                        "tts_generating",
+                        text_length=len(accumulated_text),
+                        cfg_scale=cfg_scale,
+                        inference_steps=inference_steps,
+                    )
+                    
+                    iterator = streaming_tts(
+                        accumulated_text,
+                        cfg_scale=cfg_scale,
+                        inference_steps=inference_steps,
+                        voice_key=voice_param,
+                        log_callback=enqueue_log,
+                        stop_event=stop_signal,
+                    )
+                    sentinel = object()
+                    first_ws_send_logged = False
+                    
+                    try:
+                        while ws.client_state == WebSocketState.CONNECTED:
+                            await flush_logs()
+                            chunk = await asyncio.to_thread(next, iterator, sentinel)
+                            if chunk is sentinel:
+                                break
+                            chunk = cast(np.ndarray, chunk)
+                            payload = service.chunk_to_pcm16(chunk)
+                            await ws.send_bytes(payload)
+                            if not first_ws_send_logged:
+                                first_ws_send_logged = True
+                                enqueue_log("backend_first_chunk_sent")
+                            await flush_logs()
+                    except WebSocketDisconnect:
+                        print("Client disconnected during TTS")
+                        enqueue_log("client_disconnected")
+                        stop_signal.set()
+                    finally:
+                        stop_signal.set()
+                        try:
+                            iterator_close = getattr(iterator, "close", None)
+                            if callable(iterator_close):
+                                iterator_close()
+                        except Exception:
+                            pass
+                
+                enqueue_log("tts_completed")
+        
+        except Exception as e:
+            print(f"[tts_task] Error: {e}")
+            enqueue_log("tts_error", message=str(e))
+    
+    print(f"Client connected, text={text!r}, voice={voice_param!r}")
+    
+    try:
+        # Determine operation mode based on initial query params
+        if text:
+            # Text input mode (existing behavior)
+            print("[mode] Text-to-speech mode")
+            
+            cfg_param = ws.query_params.get("cfg")
+            steps_param = ws.query_params.get("steps")
+            
+            try:
+                cfg_scale = float(cfg_param) if cfg_param is not None else 1.5
+            except ValueError:
+                cfg_scale = 1.5
+            if cfg_scale <= 0:
+                cfg_scale = 1.5
+            try:
+                inference_steps = int(steps_param) if steps_param is not None else None
+                if inference_steps is not None and inference_steps <= 0:
+                    inference_steps = None
+            except ValueError:
+                inference_steps = None
+            
+            # Use TTS lock for text mode
+            if tts_lock.locked():
+                busy_message = {
+                    "type": "log",
+                    "event": "backend_busy",
+                    "data": {"message": "Please wait for the other requests to complete."},
+                    "timestamp": get_timestamp(),
+                }
+                print("Service busy")
+                try:
+                    await ws.send_text(json.dumps(busy_message))
+                except Exception:
+                    pass
+                await ws.close(code=1013, reason="Service busy")
+                return
+            
+            async with tts_lock:
+                log_queue: "Queue[Dict[str, Any]]" = Queue()
+                
+                def enqueue_log(event: str, **data: Any) -> None:
+                    log_queue.put({"event": event, "data": data})
+                
+                enqueue_log(
+                    "backend_request_received",
+                    text_length=len(text or ""),
+                    cfg_scale=cfg_scale,
+                    inference_steps=inference_steps,
+                    voice=voice_param,
+                )
+                
+                stop_signal = threading.Event()
+                
+                iterator = streaming_tts(
+                    text,
+                    cfg_scale=cfg_scale,
+                    inference_steps=inference_steps,
+                    voice_key=voice_param,
+                    log_callback=enqueue_log,
+                    stop_event=stop_signal,
+                )
+                sentinel = object()
+                first_ws_send_logged = False
+                
+                await flush_logs()
+                
+                try:
+                    while ws.client_state == WebSocketState.CONNECTED:
+                        await flush_logs()
+                        chunk = await asyncio.to_thread(next, iterator, sentinel)
+                        if chunk is sentinel:
+                            break
+                        chunk = cast(np.ndarray, chunk)
+                        payload = service.chunk_to_pcm16(chunk)
+                        await ws.send_bytes(payload)
+                        if not first_ws_send_logged:
+                            first_ws_send_logged = True
+                            enqueue_log("backend_first_chunk_sent")
+                        await flush_logs()
+                except WebSocketDisconnect:
+                    print("Client disconnected (WebSocketDisconnect)")
+                    enqueue_log("client_disconnected")
+                    stop_signal.set()
+                finally:
+                    stop_signal.set()
+                    enqueue_log("backend_stream_complete")
+                    await flush_logs()
+                    try:
+                        iterator_close = getattr(iterator, "close", None)
+                        if callable(iterator_close):
+                            iterator_close()
+                    except Exception:
+                        pass
+                    while not log_queue.empty():
+                        try:
+                            log_queue.get_nowait()
+                        except Empty:
+                            break
+        else:
+            # Audio input mode (new)
+            print("[mode] Audio-to-speech mode (STT + TTS)")
+            stt_mode = True
+            
+            enqueue_log("ready_for_audio")
+            await flush_logs()
+            
+            # Start concurrent audio reception and STT processing
+            audio_task = asyncio.create_task(handle_audio_stream())
+            stt_task = asyncio.create_task(run_stt())
+            tts_task = asyncio.create_task(run_tts_from_queue())
+            
+            # Wait for all tasks to complete
+            try:
+                await asyncio.gather(audio_task, stt_task, tts_task)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                enqueue_log("audio_to_speech_complete")
+                await flush_logs()
+    
+    except WebSocketDisconnect:
+        print("Client disconnected")
+    except Exception as e:
+        print(f"[websocket] Unexpected error: {e}")
+        enqueue_log("websocket_error", message=str(e))
+        await flush_logs()
+    finally:
+        try:
             if ws.client_state == WebSocketState.CONNECTED:
                 await ws.close()
-            print("WS handler exit")
-    finally:
-        if acquired:
-            lock.release()
+        except Exception:
+            pass
+        print("WS handler exit")
 
 
 @app.get("/")

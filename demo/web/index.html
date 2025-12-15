@@ -320,7 +320,25 @@
   <div class="app-shell">
     <h1>VibeVoice-Realtime TTS Demo</h1>
 
+    <!-- Mode selector -->
     <section class="panel">
+      <div class="inline-field">
+        <span class="field-label">Input Mode</span>
+        <div class="control-row">
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+            <input type="radio" id="modeText" name="inputMode" value="text" checked />
+            <span style="font-size: 14px;">Text Input</span>
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+            <input type="radio" id="modeAudio" name="inputMode" value="audio" />
+            <span style="font-size: 14px;">Audio Input (Speech-to-Text)</span>
+          </label>
+        </div>
+      </div>
+    </section>
+
+    <!-- Text input section -->
+    <section class="panel" id="textInputSection">
       <label class="field">
         <span class="field-label">Text</span>
         <textarea
@@ -337,8 +355,33 @@
         <div id="streamingPreview" aria-live="polite">This area will display the streaming input text in real time.</div>
       </div>
     </section>
-          <span class="helper-text">This demo requires the full text to be provided upfront. The model then receives the text via streaming input during synthesis.<br>
-            For non-punctuation special characters, applying text normalization before processing often yields better results.</span>
+
+    <!-- Audio input section (hidden by default) -->
+    <section class="panel" id="audioInputSection" style="display: none;">
+      <div class="inline-field">
+        <span class="field-label">Audio Input</span>
+        <div class="control-row" style="flex-direction: column; align-items: flex-start;">
+          <button id="recordBtn" type="button" style="background: var(--accent); color: white; border: none; padding: 10px 24px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 14px;">
+            🎤 Start Recording
+          </button>
+          <button id="stopBtn" type="button" style="background: #e85d75; color: white; border: none; padding: 10px 24px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 14px; display: none;">
+            ⏹ Stop Recording
+          </button>
+          <span id="recordingStatus" style="font-size: 13px; color: var(--text-muted); margin-top: 8px;"></span>
+          <span id="transcriptionStatus" style="font-size: 13px; color: var(--text-muted); margin-top: 8px;"></span>
+        </div>
+      </div>
+
+      <div id="transcriptionPreviewContainer" style="border-radius: 14px; border: 1px solid var(--border); background: linear-gradient(135deg, #eef2ff 0%, #f7f9ff 100%); padding: 18px 20px; box-shadow: inset 0 1px 2px rgba(85, 98, 255, 0.12);">
+        <div style="font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 10px; font-size: 14px; margin-bottom: 8px;">
+          <span>Transcription (STT)</span>
+        </div>
+        <div id="transcriptionPreview" style="min-height: 70px; padding: 10px 12px; border-radius: 10px; background: rgba(255, 255, 255, 0.9); border: 1px solid rgba(85, 98, 255, 0.25); font-family: 'Courier New', Courier, monospace; font-size: 14px; line-height: 1.5; color: var(--text-primary); white-space: pre-wrap;">Transcribed text will appear here...</div>
+      </div>
+    </section>
+
+    <span class="helper-text">This demo requires the full text to be provided upfront. The model then receives the text via streaming input during synthesis.<br>
+      For non-punctuation special characters, applying text normalization before processing often yields better results.</span>
           
     <section class="panel control-panel">
       <div class="inline-field">
@@ -1001,6 +1044,224 @@
       start();
     }
   });
+
+  // Audio recording (STT) mode handlers
+  const modeTextRadio = document.getElementById('modeText');
+  const modeAudioRadio = document.getElementById('modeAudio');
+  const textInputSection = document.getElementById('textInputSection');
+  const audioInputSection = document.getElementById('audioInputSection');
+  const recordBtn = document.getElementById('recordBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const recordingStatus = document.getElementById('recordingStatus');
+  const transcriptionStatus = document.getElementById('transcriptionStatus');
+  const transcriptionPreview = document.getElementById('transcriptionPreview');
+
+  let mediaRecorder = null;
+  let audioChunks = [];
+  let recordingStartTime = null;
+  let recordingTimerId = null;
+  let audioSocket = null;
+  let isRecording = false;
+
+  const updateModeUI = () => {
+    const isAudioMode = modeAudioRadio.checked;
+    textInputSection.style.display = isAudioMode ? 'none' : 'block';
+    audioInputSection.style.display = isAudioMode ? 'block' : 'none';
+    if (!isAudioMode) {
+      stopRecording();
+    }
+  };
+
+  const startRecordingTimer = () => {
+    recordingStartTime = Date.now();
+    recordingTimerId = setInterval(() => {
+      const elapsed = ((Date.now() - recordingStartTime) / 1000).toFixed(1);
+      recordingStatus.textContent = `Recording: ${elapsed}s`;
+    }, 100);
+  };
+
+  const stopRecordingTimer = () => {
+    if (recordingTimerId) {
+      clearInterval(recordingTimerId);
+      recordingTimerId = null;
+    }
+    recordingStatus.textContent = '';
+  };
+
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioChunks = [];
+      
+      // Use WebM or WAV depending on browser support
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
+        ? 'audio/webm;codecs=opus' 
+        : 'audio/wav';
+      
+      mediaRecorder = new MediaRecorder(stream, { mimeType });
+      isRecording = true;
+      
+      // Collect chunks every 200ms for buffering
+      let buffer = new Float32Array(0);
+      let sampleRate = 16000;
+      let sendTimer = null;
+      
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunks.push(event.data);
+        }
+      };
+      
+      mediaRecorder.start(200);  // Emit dataavailable every 200ms
+      recordBtn.style.display = 'none';
+      stopBtn.style.display = 'inline-block';
+      recordingStatus.textContent = 'Initializing recording...';
+      transcriptionPreview.textContent = 'Waiting for audio...';
+      
+      // Decode audio and send to server via WebSocket
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      sampleRate = audioContext.sampleRate;
+      
+      // Create a media source from the stream
+      const mediaSource = audioContext.createMediaStreamSource(stream);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      
+      let audioBuffer = new Uint8Array(0);
+      
+      processor.onaudioprocess = (event) => {
+        const input = event.inputBuffer.getChannelData(0);
+        // Convert float32 to PCM16
+        const pcm16 = new Int16Array(input.length);
+        for (let i = 0; i < input.length; i++) {
+          const sample = Math.max(-1, Math.min(1, input[i]));
+          pcm16[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+        }
+        
+        // Accumulate and send in 1.5s batches (24,000 samples at 16kHz)
+        const newBuffer = new Uint8Array(audioBuffer.length + pcm16.byteLength);
+        newBuffer.set(new Uint8Array(audioBuffer));
+        newBuffer.set(new Uint8Array(pcm16.buffer), audioBuffer.length);
+        audioBuffer = newBuffer;
+        
+        const batchSize = 24000 * 2;  // 1.5s at 16kHz in bytes (PCM16)
+        if (audioBuffer.length >= batchSize && audioSocket && audioSocket.readyState === WebSocket.OPEN) {
+          audioSocket.send(audioBuffer.slice(0, batchSize));
+          audioBuffer = audioBuffer.slice(batchSize);
+        }
+      };
+      
+      mediaSource.connect(processor);
+      processor.connect(audioContext.destination);
+      
+      // Connect to WebSocket for audio streaming
+      const params = new URLSearchParams();
+      // Don't pass text param - that triggers text mode
+      const voiceValue = voiceSelect.value || '';
+      if (voiceValue) {
+        params.set('voice', voiceValue);
+      }
+      const wsUrl = `${location.origin.replace(/^http/, 'ws')}/stream?${params.toString()}`;
+      
+      audioSocket = new WebSocket(wsUrl);
+      audioSocket.binaryType = 'arraybuffer';
+      
+      audioSocket.onmessage = (event) => {
+        if (typeof event.data === 'string') {
+          // Handle log messages
+          try {
+            const payload = JSON.parse(event.data);
+            if (payload.type === 'log') {
+              const { event: logEvent, data = {}, timestamp } = payload;
+              switch (logEvent) {
+                case 'transcription_partial':
+                case 'transcription_update':
+                  transcriptionPreview.textContent = data.text || '';
+                  transcriptionStatus.textContent = `Transcribing: ${(data.timestamp_ms / 1000).toFixed(1)}s`;
+                  break;
+                case 'transcription_final':
+                  transcriptionPreview.textContent = data.text || '';
+                  transcriptionStatus.textContent = 'Transcription complete!';
+                  break;
+                case 'stt_error':
+                  transcriptionStatus.textContent = `Error: ${data.message || 'STT failed'}`;
+                  break;
+                case 'tts_started':
+                  transcriptionStatus.textContent = 'Generating speech...';
+                  break;
+              }
+            }
+          } catch (e) {
+            console.log('Log message:', event.data);
+          }
+          return;
+        }
+        
+        // Audio data
+        if (event.data instanceof ArrayBuffer) {
+          const view = new DataView(event.data);
+          const floatChunk = new Float32Array(view.byteLength / 2);
+          for (let i = 0; i < floatChunk.length; i++) {
+            floatChunk[i] = view.getInt16(i * 2, true) / 32768;
+          }
+          appendAudio(floatChunk);
+          recordedChunks.push(event.data);
+          recordedSamples += floatChunk.length;
+          
+          if (!firstBrowserChunkLogged) {
+            firstBrowserChunkLogged = true;
+            appendLog('[Frontend] Received first audio chunk');
+          }
+        }
+      };
+      
+      audioSocket.onerror = (err) => {
+        console.error('Audio WebSocket error', err);
+        transcriptionStatus.textContent = `WebSocket error: ${err?.message || 'Unknown'}`;
+        stopRecording();
+      };
+      
+      audioSocket.onclose = () => {
+        mediaSource.disconnect();
+        processor.disconnect();
+        audioContext.close();
+      };
+      
+      startRecordingTimer();
+      appendLog('[Frontend] Recording started');
+    } catch (err) {
+      recordingStatus.textContent = `Microphone error: ${err.message}`;
+      appendLog(`[Error] Microphone error: ${err.message}`);
+    }
+  };
+
+  const stopRecording = () => {
+    if (!isRecording || !mediaRecorder) {
+      return;
+    }
+    
+    isRecording = false;
+    mediaRecorder.stop();
+    mediaRecorder.stream.getTracks().forEach(track => track.stop());
+    
+    recordBtn.style.display = 'inline-block';
+    stopBtn.style.display = 'none';
+    stopRecordingTimer();
+    
+    // Send final audio_end signal
+    if (audioSocket && audioSocket.readyState === WebSocket.OPEN) {
+      audioSocket.send(JSON.stringify({ type: 'audio_end' }));
+      appendLog('[Frontend] Sent audio_end signal');
+    }
+    
+    recordingStatus.textContent = 'Recording stopped';
+    appendLog('[Frontend] Recording stopped');
+  };
+
+  modeTextRadio.addEventListener('change', updateModeUI);
+  modeAudioRadio.addEventListener('change', updateModeUI);
+  recordBtn.addEventListener('click', startRecording);
+  stopBtn.addEventListener('click', stopRecording);
+
   if (saveBtn) {
     saveBtn.addEventListener('click', handleSaveClick);
   }
@@ -1010,6 +1271,7 @@
     resetState();
     clearPreviewTimer();
     revokeDownloadUrl();
+    stopRecording();
   });
 })();
 </script>
