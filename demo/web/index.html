@@ -1090,7 +1090,22 @@
 
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const modernGetUserMedia = navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
+      const legacyGetUserMedia = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+
+      const getUserMediaCompat = (constraints) => {
+        if (modernGetUserMedia) {
+          return navigator.mediaDevices.getUserMedia(constraints);
+        }
+        if (legacyGetUserMedia) {
+          return new Promise((resolve, reject) => {
+            legacyGetUserMedia.call(navigator, constraints, resolve, reject);
+          });
+        }
+        return Promise.reject(new Error('getUserMedia not supported'));
+      };
+
+      const stream = await getUserMediaCompat({ audio: true });
       audioChunks = [];
       
       // Use WebM or WAV depending on browser support
