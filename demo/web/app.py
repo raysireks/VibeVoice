@@ -521,6 +521,7 @@ async def websocket_stream(ws: WebSocket) -> None:
     # Separate lock for STT to allow concurrent streams
     stt_mode = False
     audio_buffer = []
+    audio_ready = asyncio.Event()  # Signal when audio reception is complete
     stt_task = None
     tts_task = None
     text_queue = asyncio.Queue()
@@ -550,6 +551,7 @@ async def websocket_stream(ws: WebSocket) -> None:
     async def handle_audio_stream() -> None:
         """Handle incoming audio chunks and feed to STT."""
         try:
+                print("[audio] Starting audio reception handler")
             while ws.client_state == WebSocketState.CONNECTED:
                 try:
                     # Receive audio chunk with timeout
@@ -557,7 +559,9 @@ async def websocket_stream(ws: WebSocket) -> None:
                     
                     if message.get("type") == "binary":
                         # Audio data chunk
-                        audio_buffer.append(message.get("bytes"))
+                            chunk = message.get("bytes")
+                            audio_buffer.append(chunk)
+                            print(f"[audio] Received {len(chunk)} bytes, total buffer: {len(audio_buffer)} chunks")
                     elif message.get("type") == "text":
                         # Handle text messages (control signals)
                         try:
@@ -583,11 +587,18 @@ async def websocket_stream(ws: WebSocket) -> None:
         except Exception as e:
             print(f"[audio_stream] Error: {e}")
         finally:
+                print(f"[audio] Reception complete, total chunks: {len(audio_buffer)}")
+                audio_ready.set()  # Signal that audio is ready for processing
             enqueue_log("audio_reception_complete")
     
     async def run_stt() -> None:
         """Run STT on buffered audio and feed to TTS."""
         try:
+                # Wait for audio reception to signal completion
+                print("[stt] Waiting for audio reception to complete...")
+                await audio_ready.wait()
+                print(f"[stt] Audio reception complete, buffer has {len(audio_buffer)} chunks")
+            
             # Concatenate all audio chunks
             if not audio_buffer:
                 print("[stt] No audio data received")
@@ -830,14 +841,15 @@ async def websocket_stream(ws: WebSocket) -> None:
             enqueue_log("ready_for_audio")
             await flush_logs()
             
-            # Start concurrent audio reception and STT processing
+               # Start all tasks concurrently
+               # STT will wait for audio_ready event before processing
             audio_task = asyncio.create_task(handle_audio_stream())
-            stt_task = asyncio.create_task(run_stt())
-            tts_task = asyncio.create_task(run_tts_from_queue())
-            
-            # Wait for all tasks to complete
+               stt_task = asyncio.create_task(run_stt())
+               tts_task = asyncio.create_task(run_tts_from_queue())
+           
+               # Wait for all tasks to complete
             try:
-                await asyncio.gather(audio_task, stt_task, tts_task)
+                   await asyncio.gather(audio_task, stt_task, tts_task)
             except asyncio.CancelledError:
                 pass
             finally:
