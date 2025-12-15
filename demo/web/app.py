@@ -367,7 +367,7 @@ class StreamingTTSService:
 
     async def stream_stt(
         self,
-        audio_generator: Iterator[bytes],
+        audio_generator: Any,  # async iterator of bytes
         log_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> Iterator[Dict[str, Any]]:
         """
@@ -401,7 +401,7 @@ class StreamingTTSService:
         total_samples_processed = 0
         
         try:
-            for audio_chunk_bytes in audio_generator:
+            async for audio_chunk_bytes in audio_generator:
                 # Convert PCM16 bytes to int16 numpy array
                 chunk = np.frombuffer(audio_chunk_bytes, dtype=np.int16)
                 audio_buffer = np.concatenate([audio_buffer, chunk])
