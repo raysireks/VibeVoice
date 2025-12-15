@@ -1229,6 +1229,9 @@
       }
       const wsUrl = `${location.origin.replace(/^http/, 'ws')}/stream?${params.toString()}`;
       
+      // Set up TTS audio playback chain (for receiving and playing TTS audio)
+      createAudioChain();
+      
       audioSocket = new WebSocket(wsUrl);
       audioSocket.binaryType = 'arraybuffer';
       
