@@ -557,15 +557,18 @@ async def websocket_stream(ws: WebSocket) -> None:
                     # Receive audio chunk with timeout
                     message = await asyncio.wait_for(ws.receive(), timeout=30.0)
                     
-                    if message.get("type") == "binary":
-                        # Audio data chunk
-                        chunk = message.get("bytes")
+                    # Starlette/uvicorn websocket.receive returns dict with 'type': 'websocket.receive'
+                    # and either 'bytes' or 'text'. Check payload presence instead of type field.
+                    chunk = message.get("bytes")
+                    if chunk is not None:
                         audio_buffer.append(chunk)
                         print(f"[audio] Received {len(chunk)} bytes, total buffer: {len(audio_buffer)} chunks")
-                    elif message.get("type") == "text":
-                        # Handle text messages (control signals)
+                        continue
+
+                    text_payload = message.get("text")
+                    if text_payload is not None:
                         try:
-                            data = json.loads(message.get("text", "{}"))
+                            data = json.loads(text_payload or "{}")
                             msg_type = data.get("type")
                             
                             if msg_type == "audio_end":
@@ -577,6 +580,9 @@ async def websocket_stream(ws: WebSocket) -> None:
                                 enqueue_log("voice_changed", voice=new_voice)
                         except json.JSONDecodeError:
                             pass
+                        continue
+
+                    # Ignore other message types (e.g., pings)
                 except asyncio.TimeoutError:
                     print("[audio] Timeout waiting for audio data")
                     enqueue_log("audio_timeout")
