@@ -360,15 +360,9 @@
     <section class="panel" id="audioInputSection" style="display: none;">
       <div class="inline-field">
         <span class="field-label">Audio Input</span>
-        <div class="control-row" style="flex-direction: column; align-items: flex-start;">
-          <button id="recordBtn" type="button" style="background: var(--accent); color: white; border: none; padding: 10px 24px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 14px;">
-            🎤 Start Recording
-          </button>
-          <button id="stopBtn" type="button" style="background: #e85d75; color: white; border: none; padding: 10px 24px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 14px; display: none;">
-            ⏹ Stop Recording
-          </button>
-          <span id="recordingStatus" style="font-size: 13px; color: var(--text-muted); margin-top: 8px;"></span>
-          <span id="transcriptionStatus" style="font-size: 13px; color: var(--text-muted); margin-top: 8px;"></span>
+        <div class="control-row" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+          <span id="recordingStatus" style="font-size: 13px; color: var(--text-muted);"></span>
+          <span id="transcriptionStatus" style="font-size: 13px; color: var(--text-muted);"></span>
         </div>
       </div>
 
@@ -1110,8 +1104,6 @@
   const modeAudioRadio = document.getElementById('modeAudio');
   const textInputSection = document.getElementById('textInputSection');
   const audioInputSection = document.getElementById('audioInputSection');
-  const recordBtn = document.getElementById('recordBtn');
-  const stopBtn = document.getElementById('stopBtn');
   const recordingStatus = document.getElementById('recordingStatus');
   const transcriptionStatus = document.getElementById('transcriptionStatus');
   const transcriptionPreview = document.getElementById('transcriptionPreview');
@@ -1193,8 +1185,6 @@
       };
       
       mediaRecorder.start(200);  // Emit dataavailable every 200ms
-      recordBtn.style.display = 'none';
-      stopBtn.style.display = 'inline-block';
       recordingStatus.textContent = 'Connecting to server...';
       transcriptionPreview.textContent = 'Waiting for connection...';
       
@@ -1340,8 +1330,6 @@
         audioSocket.close();
       }
       isRecording = false;
-      recordBtn.style.display = 'inline-block';
-      stopBtn.style.display = 'none';
     }
   };
 
@@ -1355,8 +1343,6 @@
     mediaRecorder.stop();
     mediaRecorder.stream.getTracks().forEach(track => track.stop());
     
-    recordBtn.style.display = 'inline-block';
-    stopBtn.style.display = 'none';
     stopRecordingTimer();
     
     // Flush any remaining audio buffer before sending end signal
