@@ -47,12 +47,14 @@ class AudioStreamer(BaseStreamer):
             audio_chunks: Tensor of shape (num_samples, ...) containing audio chunks
             sample_indices: Tensor indicating which samples these chunks belong to
         """
+        print(f"[AudioStreamer.put] Received {len(sample_indices)} chunks")
         for i, sample_idx in enumerate(sample_indices):
             idx = sample_idx.item()
             if idx < self.batch_size and not self.finished_flags[idx]:
                 # Convert to numpy or keep as tensor based on preference
                 audio_chunk = audio_chunks[i].detach().cpu()
                 self.audio_queues[idx].put(audio_chunk, timeout=self.timeout)
+                print(f"[AudioStreamer.put] Put chunk {i} into queue {idx}")
     
     def end(self, sample_indices: Optional[torch.Tensor] = None):
         """

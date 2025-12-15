@@ -334,7 +334,11 @@ class StreamingTTSService:
 
         try:
             stream = audio_streamer.get_stream(0)
+            print(f"[stream] Starting to iterate over audio_streamer (batch_id=0)")
+            chunk_idx = 0
             for audio_chunk in stream:
+                chunk_idx += 1
+                print(f"[stream] Received chunk {chunk_idx} from streamer")
                 if torch.is_tensor(audio_chunk):
                     audio_chunk = audio_chunk.detach().cpu().to(torch.float32).numpy()
                 else:
@@ -357,6 +361,7 @@ class StreamingTTSService:
                 chunk_to_yield = audio_chunk.astype(np.float32, copy=False)
 
                 yield chunk_to_yield
+            print(f"[stream] Stream iteration complete - yielded {chunk_idx} chunks")
         finally:
             stop_signal.set()
             audio_streamer.end()
