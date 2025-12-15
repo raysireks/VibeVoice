@@ -503,6 +503,14 @@
             <span class="helper-text">Removes commas/periods in streaming STT so text flows naturally; disable if you want Whisper punctuation.</span>
           </label>
 
+          <label class="range-control" style="flex-direction: row; align-items: center; gap: 10px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <input id="sttSentenceMode" type="checkbox" checked />
+              <span>Enable sentence-based chunking</span>
+            </div>
+            <span class="helper-text">Buffers transcribed text across windows and only triggers TTS for complete sentences. Improves natural phrasing.</span>
+          </label>
+
           <label class="range-control">
             <span>STT Model Size</span>
             <select id="sttModelSize" class="select-control">
@@ -618,6 +626,7 @@
   const sttSilenceDbInput = document.getElementById('sttSilenceDb');
   const sttSilenceValue = document.getElementById('sttSilenceValue');
   const sttStripPunctuationInput = document.getElementById('sttStripPunctuation');
+  const sttSentenceModeInput = document.getElementById('sttSentenceMode');
   const sttModelSizeInput = document.getElementById('sttModelSize');
   const ttsMinWordsInput = document.getElementById('ttsMinWords');
   const ttsMinWordsValue = document.getElementById('ttsMinWordsValue');
@@ -633,6 +642,7 @@
     stt_window_ms: 1000,
     stt_silence_db: -40,
     stt_strip_punctuation: true,
+    stt_sentence_mode: true,
     stt_model_size: 'large-v3',
     tts_min_words: 5,
     tts_buffer_ms: 500,
@@ -646,7 +656,7 @@
     for (const key in CONFIG_DEFAULTS) {
       const stored = localStorage.getItem(`vibevoice_${key}`);
       if (stored !== null) {
-        if (key === 'stt_strip_punctuation') {
+        if (key === 'stt_strip_punctuation' || key === 'stt_sentence_mode') {
           config[key] = stored === 'true' || stored === '1';
         } else if (key === 'tts_disable_batching') {
           config[key] = stored === 'true' || stored === '1';
@@ -670,6 +680,7 @@
     stt_window_ms: parseInt(sttWindowMsInput.value),
     stt_silence_db: parseInt(sttSilenceDbInput.value),
     stt_strip_punctuation: Boolean(sttStripPunctuationInput.checked),
+    stt_sentence_mode: Boolean(sttSentenceModeInput.checked),
     stt_model_size: sttModelSizeInput.value,
     tts_min_words: parseInt(ttsMinWordsInput.value),
     tts_buffer_ms: parseInt(ttsBufferMsInput.value),
@@ -684,6 +695,7 @@
     sttSilenceDbInput.value = config.stt_silence_db;
     sttSilenceValue.textContent = config.stt_silence_db;
     sttStripPunctuationInput.checked = Boolean(config.stt_strip_punctuation);
+    sttSentenceModeInput.checked = Boolean(config.stt_sentence_mode);
     sttModelSizeInput.value = config.stt_model_size;
     ttsMinWordsInput.value = config.tts_min_words;
     ttsMinWordsValue.textContent = config.tts_min_words;
@@ -1034,6 +1046,13 @@
     appendLog(`[Frontend] STT strip punctuation ${currentConfig.stt_strip_punctuation ? 'enabled' : 'disabled'}`);
   });
 
+  // STT Sentence mode toggle
+  sttSentenceModeInput.addEventListener('change', () => {
+    currentConfig.stt_sentence_mode = Boolean(sttSentenceModeInput.checked);
+    saveConfig(currentConfig);
+    appendLog(`[Frontend] STT sentence mode ${currentConfig.stt_sentence_mode ? 'enabled' : 'disabled'}`);
+  });
+
   // STT Model Size dropdown
   sttModelSizeInput.addEventListener('change', () => {
     currentConfig.stt_model_size = sttModelSizeInput.value;
@@ -1344,6 +1363,7 @@
     params.set('stt_window_ms', currentConfig.stt_window_ms);
     params.set('stt_silence_db', currentConfig.stt_silence_db);
     params.set('stt_strip_punctuation', currentConfig.stt_strip_punctuation ? '1' : '0');
+    params.set('stt_sentence_mode', currentConfig.stt_sentence_mode ? '1' : '0');
     params.set('stt_model_size', currentConfig.stt_model_size);
     params.set('tts_min_words', currentConfig.tts_min_words);
     params.set('tts_buffer_ms', currentConfig.tts_buffer_ms);
@@ -1589,6 +1609,7 @@
       params.set('stt_window_ms', currentConfig.stt_window_ms);
       params.set('stt_silence_db', currentConfig.stt_silence_db);
       params.set('stt_strip_punctuation', currentConfig.stt_strip_punctuation ? '1' : '0');
+      params.set('stt_sentence_mode', currentConfig.stt_sentence_mode ? '1' : '0');
       params.set('stt_model_size', currentConfig.stt_model_size);
       params.set('tts_min_words', currentConfig.tts_min_words);
       params.set('tts_buffer_ms', currentConfig.tts_buffer_ms);

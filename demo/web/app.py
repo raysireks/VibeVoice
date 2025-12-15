@@ -402,6 +402,56 @@ class StreamingTTSService:
         pcm = (chunk * 32767.0).astype(np.int16)
         return pcm.tobytes()
 
+    @staticmethod
+    def extract_complete_sentences(buffer: str) -> Tuple[list, str]:
+        """
+        Extract complete sentences from a text buffer using regex-based sentence boundary detection.
+        
+        Returns:
+            Tuple of (list of complete sentences, remaining incomplete text)
+        
+        Example:
+            >>> extract_complete_sentences("Hello world. How are you doing")
+            (["Hello world."], "How are you doing")
+        """
+        import re
+        
+        # Common abbreviations that should NOT trigger sentence breaks
+        abbreviations = {"Dr", "Mr", "Mrs", "Ms", "Prof", "Sr", "Jr", "Inc", "Ltd", "Co", "etc", "vs", "i.e", "e.g"}
+        
+        # Regex pattern: sentence-ending punctuation (.!?) followed by space + capital letter OR end of string
+        # Also handles multiple punctuation (e.g., "..." or "!!")
+        sentence_pattern = r'([.!?]+)(?:\s+(?=[A-Z])|$)'
+        
+        if not buffer.strip():
+            return [], ""
+        
+        sentences = []
+        last_end = 0
+        
+        for match in re.finditer(sentence_pattern, buffer):
+            end_pos = match.end()
+            candidate = buffer[last_end:end_pos].strip()
+            
+            if not candidate:
+                continue
+            
+            # Check for abbreviations: if sentence ends with "Dr." or "Mr.", don't split
+            words = candidate.split()
+            if words:
+                last_word = words[-1].rstrip('.!?')
+                # If it's an abbreviation and not at the true end, skip this match
+                if last_word in abbreviations and end_pos < len(buffer):
+                    continue
+            
+            sentences.append(candidate)
+            last_end = end_pos
+        
+        # Remaining text that doesn't form a complete sentence
+        remaining = buffer[last_end:].strip()
+        
+        return sentences, remaining
+
     async def stream_stt(
         self,
         audio_generator: Any,  # async iterator of bytes
@@ -409,6 +459,7 @@ class StreamingTTSService:
         stt_window_ms: Optional[int] = None,
         stt_silence_db: Optional[float] = None,
         strip_punctuation: Optional[bool] = None,
+        sentence_mode: Optional[bool] = None,
         silence_flush_event: Optional[asyncio.Event] = None,
         silence_flush_ms: Optional[int] = None,
     ) -> Iterator[Dict[str, Any]]:
@@ -424,6 +475,7 @@ class StreamingTTSService:
             stt_window_ms: Optional window size in milliseconds (default 1000)
             stt_silence_db: Optional silence threshold in dB (default -40)
             strip_punctuation: Remove punctuation from partial transcripts (default True)
+            sentence_mode: Enable sentence-based chunking (default True)
             silence_flush_event: Event to signal extended silence (for TTS flush)
             silence_flush_ms: Silence duration threshold to trigger flush (default 500ms)
             
@@ -447,12 +499,17 @@ class StreamingTTSService:
             stt_silence_db = float(os.environ.get("STT_SILENCE_THRESHOLD_DB", "-40"))
         if strip_punctuation is None:
             strip_punctuation = os.environ.get("STT_STRIP_PUNCTUATION", "1") != "0"
+        if sentence_mode is None:
+            sentence_mode = os.environ.get("STT_SENTENCE_MODE", "1") != "0"
         if silence_flush_ms is None:
             silence_flush_ms = int(os.environ.get("TTS_SILENCE_FLUSH_MS", "500"))
         
         STT_WINDOW_SIZE_SAMPLES = int(16000 * stt_window_ms / 1000)  # Dynamic window size
         STT_SAMPLE_RATE = 16000
         punctuation_table = str.maketrans("", "", "".join(ch for ch in string.punctuation if ch != "'"))
+        
+        # Sentence buffer: accumulate text across windows for sentence boundary detection
+        sentence_buffer = ""
         
         def maybe_strip_punctuation(text: str) -> str:
             if not strip_punctuation:
@@ -513,19 +570,39 @@ class StreamingTTSService:
                         for segment in segments:
                             transcribed_text += segment.text + " "
                         
-                        transcribed_text = maybe_strip_punctuation(transcribed_text.strip())
+                        raw_text = transcribed_text.strip()
                         total_samples_processed += STT_WINDOW_SIZE_SAMPLES
-                        if transcribed_text:
-                            timestamp_ms = (total_samples_processed / STT_SAMPLE_RATE) * 1000
+                        timestamp_ms = (total_samples_processed / STT_SAMPLE_RATE) * 1000
+                        
+                        if sentence_mode and raw_text:
+                            # Sentence mode: accumulate into buffer and yield complete sentences
+                            sentence_buffer += raw_text + " "
+                            sentences, sentence_buffer = self.extract_complete_sentences(sentence_buffer)
                             
-                            result = {
-                                "text": transcribed_text,
-                                "is_final": False,
-                                "timestamp_ms": timestamp_ms,
-                            }
-                            print(f"[stt_partial] t={timestamp_ms/1000:.2f}s text='{transcribed_text}'")
-                            emit("transcription_partial", **result)
-                            yield result
+                            for sentence in sentences:
+                                # Optionally strip punctuation from each sentence
+                                final_text = maybe_strip_punctuation(sentence) if strip_punctuation else sentence
+                                if final_text:
+                                    result = {
+                                        "text": final_text,
+                                        "is_final": False,
+                                        "timestamp_ms": timestamp_ms,
+                                    }
+                                    print(f"[stt_sentence] t={timestamp_ms/1000:.2f}s text='{final_text}'")
+                                    emit("transcription_sentence", **result)
+                                    yield result
+                        elif raw_text:
+                            # Window mode: yield entire transcription window
+                            final_text = maybe_strip_punctuation(raw_text)
+                            if final_text:
+                                result = {
+                                    "text": final_text,
+                                    "is_final": False,
+                                    "timestamp_ms": timestamp_ms,
+                                }
+                                print(f"[stt_partial] t={timestamp_ms/1000:.2f}s text='{final_text}'")
+                                emit("transcription_partial", **result)
+                                yield result
                     except Exception as e:
                         print(f"[stt] Transcription error: {e}")
                         emit("transcription_error", message=str(e))
@@ -549,19 +626,52 @@ class StreamingTTSService:
                         for segment in segments:
                             transcribed_text += segment.text + " "
                         
-                        transcribed_text = maybe_strip_punctuation(transcribed_text.strip())
-                        if transcribed_text:
-                            total_samples_processed += len(audio_buffer)
-                            timestamp_ms = (total_samples_processed / STT_SAMPLE_RATE) * 1000
+                        raw_text = transcribed_text.strip()
+                        total_samples_processed += len(audio_buffer)
+                        timestamp_ms = (total_samples_processed / STT_SAMPLE_RATE) * 1000
+                        
+                        if sentence_mode and raw_text:
+                            # Add final window to buffer and flush all remaining text
+                            sentence_buffer += raw_text + " "
+                            sentences, remaining = self.extract_complete_sentences(sentence_buffer)
                             
-                            result = {
-                                "text": transcribed_text,
-                                "is_final": True,
-                                "timestamp_ms": timestamp_ms,
-                            }
-                            print(f"[stt_final] t={timestamp_ms/1000:.2f}s text='{transcribed_text}'")
-                            emit("transcription_final", **result)
-                            yield result
+                            # Yield all complete sentences
+                            for sentence in sentences:
+                                final_text = maybe_strip_punctuation(sentence) if strip_punctuation else sentence
+                                if final_text:
+                                    result = {
+                                        "text": final_text,
+                                        "is_final": False,
+                                        "timestamp_ms": timestamp_ms,
+                                    }
+                                    print(f"[stt_sentence] t={timestamp_ms/1000:.2f}s text='{final_text}'")
+                                    emit("transcription_sentence", **result)
+                                    yield result
+                            
+                            # Flush any remaining incomplete text as final
+                            if remaining:
+                                final_text = maybe_strip_punctuation(remaining) if strip_punctuation else remaining
+                                if final_text:
+                                    result = {
+                                        "text": final_text,
+                                        "is_final": True,
+                                        "timestamp_ms": timestamp_ms,
+                                    }
+                                    print(f"[stt_final] t={timestamp_ms/1000:.2f}s text='{final_text}' (incomplete sentence)")
+                                    emit("transcription_final", **result)
+                                    yield result
+                        elif raw_text:
+                            # Window mode: yield final window
+                            final_text = maybe_strip_punctuation(raw_text)
+                            if final_text:
+                                result = {
+                                    "text": final_text,
+                                    "is_final": True,
+                                    "timestamp_ms": timestamp_ms,
+                                }
+                                print(f"[stt_final] t={timestamp_ms/1000:.2f}s text='{final_text}'")
+                                emit("transcription_final", **result)
+                                yield result
                     except Exception as e:
                         print(f"[stt] Final transcription error: {e}")
                         emit("transcription_error", message=str(e))
@@ -615,6 +725,10 @@ async def websocket_stream(ws: WebSocket) -> None:
     stt_window_ms = int(ws.query_params.get("stt_window_ms", os.environ.get("STT_WINDOW_SIZE_MS", "1000")))
     stt_silence_db = float(ws.query_params.get("stt_silence_db", os.environ.get("STT_SILENCE_THRESHOLD_DB", "-40")))
     stt_model_size = ws.query_params.get("stt_model_size", os.environ.get("STT_MODEL_SIZE", "large-v3"))
+    stt_sentence_mode = parse_bool(
+        ws.query_params.get("stt_sentence_mode"),
+        os.environ.get("STT_SENTENCE_MODE", "1") != "0",
+    )
     tts_min_words = int(ws.query_params.get("tts_min_words", os.environ.get("TTS_MIN_WORDS", "5")))
     tts_buffer_ms = int(ws.query_params.get("tts_buffer_ms", os.environ.get("TTS_BUFFER_MS", "500")))
     stt_strip_punctuation = parse_bool(
@@ -729,6 +843,7 @@ async def websocket_stream(ws: WebSocket) -> None:
                 stt_window_ms=stt_window_ms,
                 stt_silence_db=stt_silence_db,
                 strip_punctuation=stt_strip_punctuation,
+                sentence_mode=stt_sentence_mode,
                 silence_flush_event=silence_flush_event,
                 silence_flush_ms=tts_silence_flush_ms,
                 log_callback=enqueue_log
@@ -788,7 +903,10 @@ async def websocket_stream(ws: WebSocket) -> None:
                 
                 accumulated_text = ""
                 # Use configured values passed from query parameters
-                # (tts_min_words and tts_buffer_ms are already set from query params above)
+                # In sentence mode, adjust TTS_MIN_WORDS to 1 since sentences are already coherent units
+                effective_tts_min_words = 1 if stt_sentence_mode else tts_min_words
+                if stt_sentence_mode:
+                    print(f"[tts_task] Sentence mode active: using effective_tts_min_words=1 (sentences pre-chunked)")
                 
                 # Continuously process text chunks as they arrive from STT
                 first_ws_send_logged = False
@@ -859,9 +977,10 @@ async def websocket_stream(ws: WebSocket) -> None:
                             word_count = len(chunk_batch.split())
                             elapsed_ms = (asyncio.get_event_loop().time() - tts_buffer_start_time) * 1000
                             
-                            if word_count >= tts_min_words or elapsed_ms >= tts_buffer_ms:
-                                print(f"[tts_task] TTS trigger: words={word_count}, elapsed_ms={elapsed_ms:.0f}")
-                                enqueue_log("tts_buffer_trigger", words=word_count, elapsed_ms=elapsed_ms, threshold_words=tts_min_words, threshold_ms=tts_buffer_ms)
+                            if word_count >= effective_tts_min_words or elapsed_ms >= tts_buffer_ms:
+                                trigger_reason = "sentence" if stt_sentence_mode and word_count >= 1 else f"words={word_count}" if word_count >= effective_tts_min_words else f"timeout={elapsed_ms:.0f}ms"
+                                print(f"[tts_task] TTS trigger ({trigger_reason}): words={word_count}, elapsed_ms={elapsed_ms:.0f}")
+                                enqueue_log("tts_buffer_trigger", words=word_count, elapsed_ms=elapsed_ms, threshold_words=effective_tts_min_words, threshold_ms=tts_buffer_ms, sentence_mode=stt_sentence_mode)
                                 break  # Start TTS generation with this batch
                     
                     # Generate TTS for this batch
