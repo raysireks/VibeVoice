@@ -584,8 +584,8 @@
 <script>
 (() => {
   const SAMPLE_RATE = 24_000;
-  const BUFFER_SIZE = 2048;
-  const PREBUFFER_SEC = 0.1;
+  const BUFFER_SIZE = 1024;  // Reduced from 2048 for lower latency
+  const PREBUFFER_SEC = 0.5;  // Increased from 0.1 to prevent gaps between chunks
 
   let audioCtx = null;
   let scriptNode = null;
@@ -1177,7 +1177,7 @@
   const pullAudio = frameCount => {
     const available = buffer.length;
     if (available === 0) {
-      return new Float32Array(frameCount);
+      return new Float32Array(frameCount);  // Return silence if buffer empty
     }
     if (available <= frameCount) {
       const chunk = buffer;
@@ -1185,6 +1185,12 @@
       if (chunk.length < frameCount) {
         const padded = new Float32Array(frameCount);
         padded.set(chunk, 0);
+        // Apply fade-out to prevent click at end
+        const fadeLength = Math.min(128, chunk.length);
+        for (let i = 0; i < fadeLength; i++) {
+          const fadeIdx = chunk.length - fadeLength + i;
+          padded[fadeIdx] *= (fadeLength - i) / fadeLength;
+        }
         return padded;
       }
       return chunk;
@@ -1262,14 +1268,28 @@
         }
       }
 
-      const chunk = pullAudio(output.length);
-      output.set(chunk);
+      // If buffer is critically low but not empty and socket still open, play slower to prevent gaps
+      // This creates a "stretching" effect when new chunks are about to arrive
+      const criticalBufferThreshold = minBufferSamples * 0.3;  // 30% of prebuffer
+      if (hasStartedPlayback && !socketClosed && buffer.length > 0 && buffer.length < criticalBufferThreshold) {
+        // Pull slightly less audio to stretch what we have while waiting for new chunks
+        const stretchedLength = Math.floor(output.length * 0.9);
+        const chunk = pullAudio(stretchedLength);
+        output.set(chunk, 0);
+        // Fill remainder with last sample to prevent click
+        if (chunk.length > 0) {
+          output.fill(chunk[chunk.length - 1], chunk.length);
+        }
+      } else {
+        const chunk = pullAudio(output.length);
+        output.set(chunk);
+      }
 
       if (hasStartedPlayback) {
         playbackSamples += output.length;
       }
 
-      if (socketClosed && buffer.length === 0 && chunk.every(sample => sample === 0)) {
+      if (socketClosed && buffer.length === 0 && output.every(sample => Math.abs(sample) < 0.001)) {
         silentFrameCount += 1;
         if (silentFrameCount >= 4) {
           stop();
