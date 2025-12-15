@@ -393,9 +393,20 @@ class StreamingTTSService:
                 except Exception as exc:
                     print(f"[stt_callback] Error while emitting {event}: {exc}")
         
-        # Audio buffer: accumulate 1.5 seconds at 16 kHz = 24,000 samples
-        STT_WINDOW_SIZE_SAMPLES = 24000  # 1.5 seconds at 16 kHz
+        # Audio buffer: accumulate 1.0 second at 16 kHz = 16,000 samples (reduced from 1.5s for lower latency)
+        STT_WINDOW_SIZE_MS = int(os.environ.get("STT_WINDOW_SIZE_MS", "1000"))
+        STT_WINDOW_SIZE_SAMPLES = int(16000 * STT_WINDOW_SIZE_MS / 1000)  # Dynamic window size
         STT_SAMPLE_RATE = 16000
+        STT_SILENCE_THRESHOLD_DB = float(os.environ.get("STT_SILENCE_THRESHOLD_DB", "-40"))
+        
+        def is_silence(audio_float: np.ndarray) -> bool:
+            """Check if audio window is below silence threshold using RMS energy."""
+            if audio_float.size == 0:
+                return True
+            rms = np.sqrt(np.mean(audio_float ** 2))
+            # Convert RMS to dB (20 * log10(rms))
+            db = 20 * np.log10(rms + 1e-10)  # Add epsilon to avoid log(0)
+            return db < STT_SILENCE_THRESHOLD_DB
         
         audio_buffer = np.array([], dtype=np.int16)
         total_samples_processed = 0
@@ -414,6 +425,13 @@ class StreamingTTSService:
                     # Convert to float32 in range [-1, 1] for Whisper
                     audio_float = window.astype(np.float32) / 32768.0
                     
+                    # Skip silent frames (reduces spurious transcriptions and saves compute)
+                    if is_silence(audio_float):
+                        total_samples_processed += STT_WINDOW_SIZE_SAMPLES
+                        print(f"[stt] Skipped silent frame at t={total_samples_processed/STT_SAMPLE_RATE:.2f}s")
+                        emit("transcription_skipped_silence", timestamp_s=total_samples_processed/STT_SAMPLE_RATE)
+                        continue
+                    
                     # Transcribe this window
                     try:
                         segments, info = self.whisper_model.transcribe(
@@ -429,8 +447,8 @@ class StreamingTTSService:
                             transcribed_text += segment.text + " "
                         
                         transcribed_text = transcribed_text.strip()
+                        total_samples_processed += STT_WINDOW_SIZE_SAMPLES
                         if transcribed_text:
-                            total_samples_processed += STT_WINDOW_SIZE_SAMPLES
                             timestamp_ms = (total_samples_processed / STT_SAMPLE_RATE) * 1000
                             
                             result = {
@@ -448,35 +466,37 @@ class StreamingTTSService:
             # Handle remaining audio in buffer when stream ends
             if len(audio_buffer) > 0:
                 audio_float = audio_buffer.astype(np.float32) / 32768.0
-                try:
-                    segments, info = self.whisper_model.transcribe(
-                        audio_float,
-                        language="en",
-                        beam_size=5,
-                        vad_filter=False,
-                        condition_on_previous_text=False,
-                    )
-                    
-                    transcribed_text = ""
-                    for segment in segments:
-                        transcribed_text += segment.text + " "
-                    
-                    transcribed_text = transcribed_text.strip()
-                    if transcribed_text:
-                        total_samples_processed += len(audio_buffer)
-                        timestamp_ms = (total_samples_processed / STT_SAMPLE_RATE) * 1000
+                # Skip final frame if it's silence
+                if not is_silence(audio_float):
+                    try:
+                        segments, info = self.whisper_model.transcribe(
+                            audio_float,
+                            language="en",
+                            beam_size=5,
+                            vad_filter=False,
+                            condition_on_previous_text=False,
+                        )
                         
-                        result = {
-                            "text": transcribed_text,
-                            "is_final": True,
-                            "timestamp_ms": timestamp_ms,
-                        }
-                        print(f"[stt_final] t={timestamp_ms/1000:.2f}s text='{transcribed_text}'")
-                        emit("transcription_final", **result)
-                        yield result
-                except Exception as e:
-                    print(f"[stt] Final transcription error: {e}")
-                    emit("transcription_error", message=str(e))
+                        transcribed_text = ""
+                        for segment in segments:
+                            transcribed_text += segment.text + " "
+                        
+                        transcribed_text = transcribed_text.strip()
+                        if transcribed_text:
+                            total_samples_processed += len(audio_buffer)
+                            timestamp_ms = (total_samples_processed / STT_SAMPLE_RATE) * 1000
+                            
+                            result = {
+                                "text": transcribed_text,
+                                "is_final": True,
+                                "timestamp_ms": timestamp_ms,
+                            }
+                            print(f"[stt_final] t={timestamp_ms/1000:.2f}s text='{transcribed_text}'")
+                            emit("transcription_final", **result)
+                            yield result
+                    except Exception as e:
+                        print(f"[stt] Final transcription error: {e}")
+                        emit("transcription_error", message=str(e))
 
 
 
@@ -599,7 +619,7 @@ async def websocket_stream(ws: WebSocket) -> None:
             enqueue_log("audio_reception_complete")
     
     async def run_stt() -> None:
-        """Run STT on streaming audio and feed to TTS."""
+        """Run STT on streaming audio and feed to TTS with backpressure monitoring."""
         try:
             enqueue_log("stt_started")
             transcribed_text = ""
@@ -625,7 +645,11 @@ async def websocket_stream(ws: WebSocket) -> None:
                     transcribed_text += text + " "
                     # Queue text for TTS processing
                     await text_queue.put(text)
-                    enqueue_log("transcription_update", text=transcribed_text.strip(), is_final=is_final)
+                    queue_size = text_queue.qsize()
+                    # Log backpressure warnings if queue is backing up
+                    if queue_size > 100:
+                        enqueue_log("queue_backpressure_warning", queue_size=queue_size, text_snippet=text[:50])
+                    enqueue_log("transcription_update", text=transcribed_text.strip(), is_final=is_final, queue_size=queue_size)
 
             # Signal that STT is complete
             await text_queue.put(None)
@@ -634,6 +658,7 @@ async def websocket_stream(ws: WebSocket) -> None:
         except Exception as e:
             print(f"[stt_task] Error: {e}")
             enqueue_log("stt_error", message=str(e))
+            # Signal TTS to exit cleanly on STT failure
             await text_queue.put(None)
     
     async def run_tts_from_queue() -> None:
@@ -662,23 +687,46 @@ async def websocket_stream(ws: WebSocket) -> None:
                 
                 accumulated_text = ""
                 stop_signal = threading.Event()
+                tts_buffer_start_time = None
+                tts_min_words = int(os.environ.get("TTS_MIN_WORDS", "5"))
+                tts_buffer_ms = int(os.environ.get("TTS_BUFFER_MS", "500"))
                 
-                # Accumulate text from queue
+                # Accumulate text from queue with adaptive trigger: start TTS after >=MIN_WORDS or BUFFER_MS elapsed
                 while True:
                     try:
-                        text_chunk = await asyncio.wait_for(text_queue.get(), timeout=2.0)
+                        # Use longer timeout to wait for audio_done signal instead of giving up after 2s
+                        text_chunk = await asyncio.wait_for(text_queue.get(), timeout=5.0)
                     except asyncio.TimeoutError:
+                        # 5s timeout indicates network stall or STT failure
+                        print("[tts_task] Timeout waiting for text (5s) - STT may have stalled")
+                        enqueue_log("tts_timeout_waiting_for_text")
                         break
                     
                     if text_chunk is None:
-                        break  # STT stream complete
+                        # STT stream complete - process accumulated text and exit
+                        print("[tts_task] STT complete signal received (None)")
+                        break
                     
                     accumulated_text += text_chunk + " "
+                    
+                    # Track time since first text arrived
+                    if tts_buffer_start_time is None:
+                        tts_buffer_start_time = asyncio.get_event_loop().time()
+                    
+                    # Check if we should start TTS generation now (adaptive trigger)
+                    word_count = len(accumulated_text.split())
+                    elapsed_ms = (asyncio.get_event_loop().time() - tts_buffer_start_time) * 1000
+                    
+                    if word_count >= tts_min_words or elapsed_ms >= tts_buffer_ms:
+                        print(f"[tts_task] TTS trigger: words={word_count}, elapsed_ms={elapsed_ms:.0f}")
+                        enqueue_log("tts_buffer_trigger", words=word_count, elapsed_ms=elapsed_ms, threshold_words=tts_min_words, threshold_ms=tts_buffer_ms)
+                        break  # Start TTS generation with accumulated text
                 
                 if accumulated_text.strip():
                     enqueue_log(
                         "tts_generating",
                         text_length=len(accumulated_text),
+                        word_count=len(accumulated_text.split()),
                         cfg_scale=cfg_scale,
                         inference_steps=inference_steps,
                     )
@@ -729,8 +777,9 @@ async def websocket_stream(ws: WebSocket) -> None:
     print(f"Client connected, text={text!r}, voice={voice_param!r}")
     
     try:
-        # Determine operation mode based on initial query params
-        if text:
+        # Determine operation mode based on explicit mode parameter
+        mode = ws.query_params.get("mode", "text")  # Default to text mode for backward compatibility
+        if mode == "text":
             # Text input mode (existing behavior)
             print("[mode] Text-to-speech mode")
             
@@ -828,7 +877,7 @@ async def websocket_stream(ws: WebSocket) -> None:
                         except Empty:
                             break
         else:
-            # Audio input mode (new)
+            # Audio input mode (STT + TTS)
             print("[mode] Audio-to-speech mode (STT + TTS)")
             stt_mode = True
             

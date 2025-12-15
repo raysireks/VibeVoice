@@ -818,9 +818,32 @@
     }
   };
 
+  // State machine for button coordination (prevents race conditions)
+  const STATE = Object.freeze({
+    IDLE: 'IDLE',                      // No operation in progress
+    CONNECTING: 'CONNECTING',          // WebSocket connecting or audio setup
+    RECORDING: 'RECORDING',            // Audio mode: recording in progress
+    STREAMING_TTS: 'STREAMING_TTS',    // Text or audio mode: TTS generating
+    COMPLETE: 'COMPLETE',              // Operation finished, waiting for stop
+  });
+
+  let appState = STATE.IDLE;
+
+  const setAppState = (newState, reason = '') => {
+    console.log(`[State] ${appState} → ${newState}${reason ? ` (${reason})` : ''}`);
+    appState = newState;
+  };
+
   const updateButtonLabel = () => {
-    controlBtn.textContent = isPlaying ? 'Stop' : 'Start';
-    controlBtn.classList.toggle('playing', isPlaying);
+    const isAudioMode = modeAudioRadio.checked;
+    if (isAudioMode) {
+      // Audio mode: "Record & Speak" / "Stop Recording"
+      controlBtn.textContent = isRecording ? '⏹ Stop Recording' : '🎤 Record & Speak';
+    } else {
+      // Text mode: "Start" / "Stop"
+      controlBtn.textContent = isPlaying ? '⏹ Stop' : '▶ Start';
+    }
+    controlBtn.classList.toggle('playing', isPlaying || isRecording);
   };
 
   const appendAudio = chunk => {
@@ -957,11 +980,13 @@
     clearRecordedChunks();
     isPlaying = true;
     previewActive = true;
+    setAppState(STATE.STREAMING_TTS, 'Text TTS starting');
     updateStreamingPreview();
     updateButtonLabel();
     createAudioChain();
 
     const params = new URLSearchParams();
+    params.set('mode', 'text');  // Explicit text mode
     params.set('text', textValue);
     if (!Number.isNaN(cfgValue)) {
       params.set('cfg', cfgValue.toFixed(3));
@@ -976,6 +1001,10 @@
 
     socket = new WebSocket(wsUrl);
     socket.binaryType = 'arraybuffer';
+
+    socket.onopen = () => {
+      setAppState(STATE.STREAMING_TTS, 'WebSocket connected');
+    };
 
     socket.onmessage = event => {
       if (typeof event.data === 'string') {
@@ -1005,12 +1034,14 @@
 
     socket.onerror = err => {
       console.error('WebSocket error', err);
+      setAppState(STATE.IDLE, 'WebSocket error');
       appendLog(`[Error] WebSocket error: ${err?.message || err}`);
       stop();
     };
 
     socket.onclose = () => {
       socket = null;
+      setAppState(STATE.COMPLETE, 'WebSocket closed');
       if (recordedSamples > 0) {
         recordingComplete = true;
         updateSaveButtonState();
@@ -1021,10 +1052,12 @@
   const stop = () => {
     if (!isPlaying) {
       resetState(false);
+      setAppState(STATE.IDLE, 'Stop called while not playing');
       updateButtonLabel();
       return;
     }
     resetState(false);
+    setAppState(STATE.IDLE, 'Playback stopped');
     setPlaybackElapsed(Math.min(lastPlaybackElapsed, modelGeneratedTotal));
     appendLog('[Frontend] Playback stopped');
     if (recordedSamples > 0) {
@@ -1038,10 +1071,37 @@
   };
 
   controlBtn.addEventListener('click', () => {
-    if (isPlaying) {
-      stop();
+    const isAudioMode = modeAudioRadio.checked;
+    
+    if (isAudioMode) {
+      // Audio mode: dispatch to startRecording() or stopRecording()
+      if (isRecording) {
+        stopRecording();
+      } else {
+        // Guard: prevent starting if already in progress
+        if (appState === STATE.CONNECTING || appState === STATE.RECORDING || appState === STATE.STREAMING_TTS) {
+          appendLog('[Frontend] Cannot start recording: operation in progress');
+          return;
+        }
+        setAppState(STATE.CONNECTING, 'Starting audio mode');
+        startRecording().catch(err => {
+          setAppState(STATE.IDLE, 'Audio mode failed');
+          appendLog(`[Error] Failed to start recording: ${err.message}`);
+        });
+      }
     } else {
-      start();
+      // Text mode: dispatch to start() or stop()
+      if (isPlaying) {
+        stop();
+      } else {
+        // Guard: prevent starting if already in progress
+        if (appState === STATE.CONNECTING || appState === STATE.STREAMING_TTS) {
+          appendLog('[Frontend] Cannot start: operation in progress');
+          return;
+        }
+        setAppState(STATE.CONNECTING, 'Starting text mode');
+        start();
+      }
     }
   });
 
@@ -1093,6 +1153,7 @@
 
   const startRecording = async () => {
     try {
+      setAppState(STATE.CONNECTING, 'Getting user media');
       const modernGetUserMedia = navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
       const legacyGetUserMedia = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
 
@@ -1118,6 +1179,7 @@
       
       mediaRecorder = new MediaRecorder(stream, { mimeType });
       isRecording = true;
+      setAppState(STATE.RECORDING, 'Audio recording started');
       
       // Collect chunks every 200ms for buffering
       let buffer = new Float32Array(0);
@@ -1159,24 +1221,18 @@
           pcm16[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
         }
         
-        // Accumulate and send in 1.5s batches (24,000 samples at 16kHz)
-        const newBuffer = new Uint8Array(audioBufferHolder.data.length + pcm16.byteLength);
-        newBuffer.set(new Uint8Array(audioBufferHolder.data));
-        newBuffer.set(new Uint8Array(pcm16.buffer), audioBufferHolder.data.length);
-        audioBufferHolder.data = newBuffer;
-        
-        const batchSize = 24000 * 2;  // 1.5s at 16kHz in bytes (PCM16)
-        if (audioBufferHolder.data.length >= batchSize && audioSocket && audioSocket.readyState === WebSocket.OPEN) {
-          const chunk = audioBufferHolder.data.slice(0, batchSize);
+        // Send PCM16 chunks immediately (every ~256ms at 4096 samples) for realtime streaming
+        // This reduces latency from ~1.5s to ~300-400ms
+        if (audioSocket && audioSocket.readyState === WebSocket.OPEN) {
+          const chunk = new Uint8Array(pcm16.buffer);
           audioSocket.send(chunk);
-          console.log(`[Audio] Sent ${chunk.byteLength} bytes to server`);
-          audioBufferHolder.data = audioBufferHolder.data.slice(batchSize);
+          console.log(`[Audio] Sent ${chunk.byteLength} bytes immediately (queue efficient)`);
         }
       };
       
       // Connect to WebSocket for audio streaming FIRST
       const params = new URLSearchParams();
-      // Don't pass text param - that triggers text mode
+      params.set('mode', 'audio');  // Explicit audio mode
       const voiceValue = voiceSelect.value || '';
       if (voiceValue) {
         params.set('voice', voiceValue);
@@ -1189,6 +1245,7 @@
       // Wait for WebSocket to open before starting audio
       await new Promise((resolve, reject) => {
         audioSocket.onopen = () => {
+          setAppState(STATE.STREAMING_TTS, 'WebSocket connected, starting STT+TTS');
           appendLog('[Frontend] WebSocket connected');
           recordingStatus.textContent = 'Recording... speak now';
           transcriptionPreview.textContent = 'Listening...';
@@ -1272,6 +1329,7 @@
       appendLog('[Frontend] Recording started');
     } catch (err) {
       recordingStatus.textContent = `Error: ${err.message}`;
+      setAppState(STATE.IDLE, 'Recording error');
       appendLog(`[Error] ${err.message}`);
       // Clean up on error
       if (mediaRecorder) {
@@ -1293,6 +1351,7 @@
     }
     
     isRecording = false;
+    setAppState(STATE.IDLE, 'Recording stopped');
     mediaRecorder.stop();
     mediaRecorder.stream.getTracks().forEach(track => track.stop());
     
@@ -1324,13 +1383,12 @@
     }
     
     recordingStatus.textContent = 'Recording stopped';
+    updateButtonLabel();
     appendLog('[Frontend] Recording stopped');
   };
 
   modeTextRadio.addEventListener('change', updateModeUI);
   modeAudioRadio.addEventListener('change', updateModeUI);
-  recordBtn.addEventListener('click', startRecording);
-  stopBtn.addEventListener('click', stopRecording);
 
   if (saveBtn) {
     saveBtn.addEventListener('click', handleSaveClick);
