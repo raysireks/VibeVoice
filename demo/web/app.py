@@ -629,7 +629,7 @@ async def websocket_stream(ws: WebSocket) -> None:
                 log_callback=enqueue_log
             )
             
-            for result in stt_gen:
+            async for result in stt_gen:
                 text = result.get("text", "").strip()
                 is_final = result.get("is_final", False)
                 
