@@ -740,6 +740,7 @@ async def websocket_stream(ws: WebSocket) -> None:
                     # Generate TTS for this batch
                     if chunk_batch.strip():
                         accumulated_text += chunk_batch
+                        print(f"[tts_task] Starting TTS generation for text: '{chunk_batch[:50]}...'")
                         enqueue_log(
                             "tts_generating",
                             text_length=len(chunk_batch),
@@ -759,15 +760,20 @@ async def websocket_stream(ws: WebSocket) -> None:
                         )
                         sentinel = object()
                         
+                        chunk_count = 0
                         try:
                             while ws.client_state == WebSocketState.CONNECTED:
                                 await flush_logs()
                                 chunk = await asyncio.to_thread(next, iterator, sentinel)
                                 if chunk is sentinel:
+                                    print(f"[tts_task] TTS generation complete - sent {chunk_count} audio chunks")
                                     break
                                 chunk = cast(np.ndarray, chunk)
                                 payload = service.chunk_to_pcm16(chunk)
                                 await ws.send_bytes(payload)
+                                chunk_count += 1
+                                if chunk_count == 1:
+                                    print(f"[tts_task] First audio chunk sent ({len(payload)} bytes)")
                                 if not first_ws_send_logged:
                                     first_ws_send_logged = True
                                     enqueue_log("backend_first_chunk_sent")
