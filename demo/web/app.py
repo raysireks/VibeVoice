@@ -3,6 +3,7 @@ import builtins
 import asyncio
 import json
 import os
+import string
 import threading
 import traceback
 from pathlib import Path
@@ -407,6 +408,7 @@ class StreamingTTSService:
         log_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
         stt_window_ms: Optional[int] = None,
         stt_silence_db: Optional[float] = None,
+        strip_punctuation: Optional[bool] = None,
     ) -> Iterator[Dict[str, Any]]:
         """
         Stream speech-to-text using Faster Whisper with partial transcriptions.
@@ -419,6 +421,7 @@ class StreamingTTSService:
             log_callback: Optional callback for logging events
             stt_window_ms: Optional window size in milliseconds (default 1000)
             stt_silence_db: Optional silence threshold in dB (default -40)
+            strip_punctuation: Remove punctuation from partial transcripts (default True)
             
         Yields:
             Dicts with keys: {'text': str, 'is_final': bool, 'timestamp_ms': float}
@@ -438,9 +441,17 @@ class StreamingTTSService:
             stt_window_ms = int(os.environ.get("STT_WINDOW_SIZE_MS", "1000"))
         if stt_silence_db is None:
             stt_silence_db = float(os.environ.get("STT_SILENCE_THRESHOLD_DB", "-40"))
+        if strip_punctuation is None:
+            strip_punctuation = os.environ.get("STT_STRIP_PUNCTUATION", "1") != "0"
         
         STT_WINDOW_SIZE_SAMPLES = int(16000 * stt_window_ms / 1000)  # Dynamic window size
         STT_SAMPLE_RATE = 16000
+        punctuation_table = str.maketrans("", "", "".join(ch for ch in string.punctuation if ch != "'"))
+        
+        def maybe_strip_punctuation(text: str) -> str:
+            if not strip_punctuation:
+                return text
+            return " ".join(text.translate(punctuation_table).split())
         
         def is_silence(audio_float: np.ndarray) -> bool:
             """Check if audio window is below silence threshold using RMS energy."""
@@ -489,7 +500,7 @@ class StreamingTTSService:
                         for segment in segments:
                             transcribed_text += segment.text + " "
                         
-                        transcribed_text = transcribed_text.strip()
+                        transcribed_text = maybe_strip_punctuation(transcribed_text.strip())
                         total_samples_processed += STT_WINDOW_SIZE_SAMPLES
                         if transcribed_text:
                             timestamp_ms = (total_samples_processed / STT_SAMPLE_RATE) * 1000
@@ -524,7 +535,7 @@ class StreamingTTSService:
                         for segment in segments:
                             transcribed_text += segment.text + " "
                         
-                        transcribed_text = transcribed_text.strip()
+                        transcribed_text = maybe_strip_punctuation(transcribed_text.strip())
                         if transcribed_text:
                             total_samples_processed += len(audio_buffer)
                             timestamp_ms = (total_samples_processed / STT_SAMPLE_RATE) * 1000
@@ -581,12 +592,25 @@ async def websocket_stream(ws: WebSocket) -> None:
     no_playback = ws.query_params.get("no_playback", "0") == "1"  # Echo cancellation: suppress TTS output during recording
     mode = ws.query_params.get("mode", "text")
     
+    def parse_bool(val: Optional[str], default: bool) -> bool:
+        if val is None:
+            return default
+        return val.lower() not in ("0", "false", "no", "off")
+    
     # Parse configuration parameters from query params with fallback to environment variables
     stt_window_ms = int(ws.query_params.get("stt_window_ms", os.environ.get("STT_WINDOW_SIZE_MS", "1000")))
     stt_silence_db = float(ws.query_params.get("stt_silence_db", os.environ.get("STT_SILENCE_THRESHOLD_DB", "-40")))
     stt_model_size = ws.query_params.get("stt_model_size", os.environ.get("STT_MODEL_SIZE", "large-v3"))
     tts_min_words = int(ws.query_params.get("tts_min_words", os.environ.get("TTS_MIN_WORDS", "5")))
     tts_buffer_ms = int(ws.query_params.get("tts_buffer_ms", os.environ.get("TTS_BUFFER_MS", "500")))
+    stt_strip_punctuation = parse_bool(
+        ws.query_params.get("stt_strip_punctuation"),
+        os.environ.get("STT_STRIP_PUNCTUATION", "1") != "0",
+    )
+    tts_disable_batching = parse_bool(
+        ws.query_params.get("tts_disable_batching"),
+        os.environ.get("TTS_DISABLE_BATCHING", "0") != "0",
+    )
     
     service: StreamingTTSService = app.state.tts_service
     tts_lock: asyncio.Lock = app.state.websocket_lock
@@ -688,6 +712,7 @@ async def websocket_stream(ws: WebSocket) -> None:
                 audio_gen(),
                 stt_window_ms=stt_window_ms,
                 stt_silence_db=stt_silence_db,
+                strip_punctuation=stt_strip_punctuation,
                 log_callback=enqueue_log
             )
 
@@ -697,8 +722,12 @@ async def websocket_stream(ws: WebSocket) -> None:
 
                 if text:
                     transcribed_text += text + " "
-                    # Queue text for TTS processing
-                    await text_queue.put(text)
+                    # Queue text for TTS processing (optionally per-word)
+                    if tts_disable_batching:
+                        for word in text.split():
+                            await text_queue.put(word)
+                    else:
+                        await text_queue.put(text)
                     queue_size = text_queue.qsize()
                     # Log backpressure warnings if queue is backing up
                     if queue_size > 100:
@@ -746,53 +775,70 @@ async def websocket_stream(ws: WebSocket) -> None:
                 # Continuously process text chunks as they arrive from STT
                 first_ws_send_logged = False
                 stt_complete = False  # Track if STT has signaled completion
-                
+
                 while True:
-                    # Accumulate text until adaptive trigger threshold
-                    tts_buffer_start_time = asyncio.get_event_loop().time()
-                    chunk_batch = ""
-                    
-                    while True:
+                    if tts_disable_batching:
+                        # No batching: consume one word at a time
                         try:
-                            # Wait for text from STT queue (no timeout - wait indefinitely until STT completes)
                             text_chunk = await text_queue.get()
                         except asyncio.TimeoutError:
-                            # This should not happen with no timeout, but handle gracefully
-                            if chunk_batch.strip():
-                                print("[tts_task] Timeout waiting for more text, processing buffered text")
-                                enqueue_log("tts_timeout_processing_buffer", text_length=len(chunk_batch))
-                                break
-                            else:
-                                # Should never reach here - no timeout set
-                                print("[tts_task] Unexpected timeout")
-                                enqueue_log("tts_unexpected_timeout")
-                                enqueue_log("tts_completed")
-                                return
-                        
+                            enqueue_log("tts_unexpected_timeout")
+                            enqueue_log("tts_completed")
+                            return
+
                         if text_chunk is None:
-                            # STT stream complete - process final accumulated text and exit
-                            print(f"[tts_task] STT complete signal received. Final batch: '{chunk_batch}'")
-                            stt_complete = True
-                            if chunk_batch.strip():
-                                break  # Process final batch
-                            else:
-                                enqueue_log("tts_completed")
-                                return
+                            enqueue_log("tts_completed")
+                            return
+
+                        chunk_batch = text_chunk.strip()
+                        if not chunk_batch:
+                            continue
+                    else:
+                        # Adaptive batching mode (existing behavior)
+                        tts_buffer_start_time = asyncio.get_event_loop().time()
+                        chunk_batch = ""
                         
-                        chunk_batch += text_chunk + " "
-                        
-                        # Check if we should start TTS generation now (adaptive trigger)
-                        word_count = len(chunk_batch.split())
-                        elapsed_ms = (asyncio.get_event_loop().time() - tts_buffer_start_time) * 1000
-                        
-                        if word_count >= tts_min_words or elapsed_ms >= tts_buffer_ms:
-                            print(f"[tts_task] TTS trigger: words={word_count}, elapsed_ms={elapsed_ms:.0f}")
-                            enqueue_log("tts_buffer_trigger", words=word_count, elapsed_ms=elapsed_ms, threshold_words=tts_min_words, threshold_ms=tts_buffer_ms)
-                            break  # Start TTS generation with this batch
+                        while True:
+                            try:
+                                # Wait for text from STT queue (no timeout - wait indefinitely until STT completes)
+                                text_chunk = await text_queue.get()
+                            except asyncio.TimeoutError:
+                                # This should not happen with no timeout, but handle gracefully
+                                if chunk_batch.strip():
+                                    print("[tts_task] Timeout waiting for more text, processing buffered text")
+                                    enqueue_log("tts_timeout_processing_buffer", text_length=len(chunk_batch))
+                                    break
+                                else:
+                                    # Should never reach here - no timeout set
+                                    print("[tts_task] Unexpected timeout")
+                                    enqueue_log("tts_unexpected_timeout")
+                                    enqueue_log("tts_completed")
+                                    return
+                            
+                            if text_chunk is None:
+                                # STT stream complete - process final accumulated text and exit
+                                print(f"[tts_task] STT complete signal received. Final batch: '{chunk_batch}'")
+                                stt_complete = True
+                                if chunk_batch.strip():
+                                    break  # Process final batch
+                                else:
+                                    enqueue_log("tts_completed")
+                                    return
+                            
+                            chunk_batch += text_chunk + " "
+                            
+                            # Check if we should start TTS generation now (adaptive trigger)
+                            word_count = len(chunk_batch.split())
+                            elapsed_ms = (asyncio.get_event_loop().time() - tts_buffer_start_time) * 1000
+                            
+                            if word_count >= tts_min_words or elapsed_ms >= tts_buffer_ms:
+                                print(f"[tts_task] TTS trigger: words={word_count}, elapsed_ms={elapsed_ms:.0f}")
+                                enqueue_log("tts_buffer_trigger", words=word_count, elapsed_ms=elapsed_ms, threshold_words=tts_min_words, threshold_ms=tts_buffer_ms)
+                                break  # Start TTS generation with this batch
                     
                     # Generate TTS for this batch
                     if chunk_batch.strip():
-                        accumulated_text += chunk_batch
+                        accumulated_text += chunk_batch + (" " if not tts_disable_batching else "")
                         print(f"[tts_task] Starting TTS generation for text: '{chunk_batch[:50]}...'")
                         enqueue_log(
                             "tts_generating",
@@ -801,6 +847,7 @@ async def websocket_stream(ws: WebSocket) -> None:
                             total_text_length=len(accumulated_text),
                             cfg_scale=cfg_scale,
                             inference_steps=inference_steps,
+                            disable_batching=tts_disable_batching,
                         )
                         
                         # Create fresh stop_signal for this batch (prevents reuse across batches)
@@ -862,7 +909,7 @@ async def websocket_stream(ws: WebSocket) -> None:
                                 pass
                     
                     # Check if we should continue (look for more text or exit)
-                    if stt_complete:  # STT signaled completion - exit after processing final batch
+                    if not tts_disable_batching and stt_complete:
                         print("[tts_task] STT complete - exiting TTS loop")
                         break
                 

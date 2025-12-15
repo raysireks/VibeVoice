@@ -495,6 +495,14 @@
             <span class="helper-text">Skips transcription of silent frames below this threshold. Default: -40dB</span>
           </label>
 
+          <label class="range-control" style="flex-direction: row; align-items: center; gap: 10px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <input id="sttStripPunctuation" type="checkbox" checked />
+              <span>Strip punctuation from partials</span>
+            </div>
+            <span class="helper-text">Removes commas/periods in streaming STT so text flows naturally; disable if you want Whisper punctuation.</span>
+          </label>
+
           <label class="range-control">
             <span>STT Model Size</span>
             <select id="sttModelSize" class="select-control">
@@ -531,6 +539,14 @@
               <span style="font-size: 12px; color: var(--text-muted);">ms</span>
             </div>
             <span class="helper-text">Max time to wait before triggering TTS. Lower = more responsive. Default: 500ms</span>
+          </label>
+
+          <label class="range-control" style="flex-direction: row; align-items: center; gap: 10px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <input id="ttsDisableBatching" type="checkbox" />
+              <span>Disable TTS batching (per-word)</span>
+            </div>
+            <span class="helper-text">Send each STT word directly to TTS with no adaptive buffering. Use for maximal streaming at the cost of more TTS calls.</span>
           </label>
         </div>
 
@@ -591,20 +607,24 @@
   const sttWindowValue = document.getElementById('sttWindowValue');
   const sttSilenceDbInput = document.getElementById('sttSilenceDb');
   const sttSilenceValue = document.getElementById('sttSilenceValue');
+  const sttStripPunctuationInput = document.getElementById('sttStripPunctuation');
   const sttModelSizeInput = document.getElementById('sttModelSize');
   const ttsMinWordsInput = document.getElementById('ttsMinWords');
   const ttsMinWordsValue = document.getElementById('ttsMinWordsValue');
   const ttsBufferMsInput = document.getElementById('ttsBufferMs');
   const ttsBufferValue = document.getElementById('ttsBufferValue');
+  const ttsDisableBatchingInput = document.getElementById('ttsDisableBatching');
   const restoreDefaultSettingsBtn = document.getElementById('restoreDefaultSettings');
 
   // Configuration Defaults
   const CONFIG_DEFAULTS = {
     stt_window_ms: 1000,
     stt_silence_db: -40,
+    stt_strip_punctuation: true,
     stt_model_size: 'large-v3',
     tts_min_words: 5,
     tts_buffer_ms: 500,
+    tts_disable_batching: false,
   };
 
   // Load configuration from localStorage or use defaults
@@ -613,7 +633,13 @@
     for (const key in CONFIG_DEFAULTS) {
       const stored = localStorage.getItem(`vibevoice_${key}`);
       if (stored !== null) {
-        config[key] = isNaN(stored) ? stored : parseFloat(stored);
+        if (key === 'stt_strip_punctuation') {
+          config[key] = stored === 'true' || stored === '1';
+        } else if (key === 'tts_disable_batching') {
+          config[key] = stored === 'true' || stored === '1';
+        } else {
+          config[key] = isNaN(stored) ? stored : parseFloat(stored);
+        }
       }
     }
     return config;
@@ -630,9 +656,11 @@
   const getCurrentConfig = () => ({
     stt_window_ms: parseInt(sttWindowMsInput.value),
     stt_silence_db: parseInt(sttSilenceDbInput.value),
+    stt_strip_punctuation: Boolean(sttStripPunctuationInput.checked),
     stt_model_size: sttModelSizeInput.value,
     tts_min_words: parseInt(ttsMinWordsInput.value),
     tts_buffer_ms: parseInt(ttsBufferMsInput.value),
+    tts_disable_batching: Boolean(ttsDisableBatchingInput.checked),
   });
 
   // Update UI inputs from configuration
@@ -641,11 +669,13 @@
     sttWindowValue.textContent = config.stt_window_ms;
     sttSilenceDbInput.value = config.stt_silence_db;
     sttSilenceValue.textContent = config.stt_silence_db;
+    sttStripPunctuationInput.checked = Boolean(config.stt_strip_punctuation);
     sttModelSizeInput.value = config.stt_model_size;
     ttsMinWordsInput.value = config.tts_min_words;
     ttsMinWordsValue.textContent = config.tts_min_words;
     ttsBufferMsInput.value = config.tts_buffer_ms;
     ttsBufferValue.textContent = config.tts_buffer_ms;
+    ttsDisableBatchingInput.checked = Boolean(config.tts_disable_batching);
   };
 
   // Initialize settings from localStorage
@@ -981,6 +1011,13 @@
     saveConfig(currentConfig);
   });
 
+  // STT Punctuation stripping toggle
+  sttStripPunctuationInput.addEventListener('change', () => {
+    currentConfig.stt_strip_punctuation = Boolean(sttStripPunctuationInput.checked);
+    saveConfig(currentConfig);
+    appendLog(`[Frontend] STT strip punctuation ${currentConfig.stt_strip_punctuation ? 'enabled' : 'disabled'}`);
+  });
+
   // STT Model Size dropdown
   sttModelSizeInput.addEventListener('change', () => {
     currentConfig.stt_model_size = sttModelSizeInput.value;
@@ -1000,6 +1037,13 @@
     ttsBufferValue.textContent = ttsBufferMsInput.value;
     currentConfig.tts_buffer_ms = parseInt(ttsBufferMsInput.value);
     saveConfig(currentConfig);
+  });
+
+  // TTS disable batching toggle
+  ttsDisableBatchingInput.addEventListener('change', () => {
+    currentConfig.tts_disable_batching = Boolean(ttsDisableBatchingInput.checked);
+    saveConfig(currentConfig);
+    appendLog(`[Frontend] TTS batching ${currentConfig.tts_disable_batching ? 'disabled (per-word)' : 'enabled (adaptive)'}`);
   });
 
   // Restore Defaults button
@@ -1256,9 +1300,11 @@
     // Add advanced configuration parameters
     params.set('stt_window_ms', currentConfig.stt_window_ms);
     params.set('stt_silence_db', currentConfig.stt_silence_db);
+    params.set('stt_strip_punctuation', currentConfig.stt_strip_punctuation ? '1' : '0');
     params.set('stt_model_size', currentConfig.stt_model_size);
     params.set('tts_min_words', currentConfig.tts_min_words);
     params.set('tts_buffer_ms', currentConfig.tts_buffer_ms);
+    params.set('tts_disable_batching', currentConfig.tts_disable_batching ? '1' : '0');
     const wsUrl = `${location.origin.replace(/^http/, 'ws')}/stream?${params.toString()}`;
 
     socket = new WebSocket(wsUrl);
@@ -1498,9 +1544,11 @@
       // Add advanced configuration parameters
       params.set('stt_window_ms', currentConfig.stt_window_ms);
       params.set('stt_silence_db', currentConfig.stt_silence_db);
+      params.set('stt_strip_punctuation', currentConfig.stt_strip_punctuation ? '1' : '0');
       params.set('stt_model_size', currentConfig.stt_model_size);
       params.set('tts_min_words', currentConfig.tts_min_words);
       params.set('tts_buffer_ms', currentConfig.tts_buffer_ms);
+      params.set('tts_disable_batching', currentConfig.tts_disable_batching ? '1' : '0');
       const wsUrl = `${location.origin.replace(/^http/, 'ws')}/stream?${params.toString()}`;
       
       // Create WebSocket first, then set up playback with reference to it
