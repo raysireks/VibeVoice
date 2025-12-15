@@ -906,7 +906,7 @@
     stopPlaybackTimer();
   };
 
-  const createAudioChain = () => {
+  const createAudioChain = (websocket = null) => {
     teardownAudio();
     resetPlaybackFlags();
     audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
@@ -917,7 +917,9 @@
     scriptNode.onaudioprocess = event => {
       const output = event.outputBuffer.getChannelData(0);
       const needPrebuffer = !hasStartedPlayback;
-      const socketClosed = !socket || socket.readyState === WebSocket.CLOSED || socket.readyState === WebSocket.CLOSING;
+      // Use provided websocket or default to global socket (for text mode vs audio mode)
+      const activeSocket = websocket || socket;
+      const socketClosed = !activeSocket || activeSocket.readyState === WebSocket.CLOSED || activeSocket.readyState === WebSocket.CLOSING;
 
       if (needPrebuffer) {
         if (buffer.length >= minBufferSamples || socketClosed) {
@@ -1229,12 +1231,14 @@
       }
       const wsUrl = `${location.origin.replace(/^http/, 'ws')}/stream?${params.toString()}`;
       
-      // Set up TTS audio playback chain (for receiving and playing TTS audio)
-      createAudioChain();
-      isPlaying = true;  // Mark as playing so stop() works correctly
-      
+      // Create WebSocket first, then set up playback with reference to it
       audioSocket = new WebSocket(wsUrl);
       audioSocket.binaryType = 'arraybuffer';
+      
+      // Set up TTS audio playback chain (for receiving and playing TTS audio)
+      // Pass audioSocket so playback chain knows which socket to monitor
+      createAudioChain(audioSocket);
+      isPlaying = true;  // Mark as playing so stop() works correctly
       
       // Wait for WebSocket to open before starting audio
       await new Promise((resolve, reject) => {
