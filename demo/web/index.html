@@ -1062,6 +1062,9 @@
   let recordingTimerId = null;
   let audioSocket = null;
   let isRecording = false;
+  let audioBufferRef = null;  // Reference to audio buffer for cleanup
+  let audioProcessorRef = null;  // Reference to processor for cleanup
+  let audioSourceRef = null;  // Reference to media source for cleanup
 
   const updateModeUI = () => {
     const isAudioMode = modeAudioRadio.checked;
@@ -1130,8 +1133,8 @@
       mediaRecorder.start(200);  // Emit dataavailable every 200ms
       recordBtn.style.display = 'none';
       stopBtn.style.display = 'inline-block';
-      recordingStatus.textContent = 'Initializing recording...';
-      transcriptionPreview.textContent = 'Waiting for audio...';
+      recordingStatus.textContent = 'Connecting to server...';
+      transcriptionPreview.textContent = 'Waiting for connection...';
       
       // Decode audio and send to server via WebSocket
       const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
@@ -1141,7 +1144,11 @@
       const mediaSource = audioContext.createMediaStreamSource(stream);
       const processor = audioContext.createScriptProcessor(4096, 1, 1);
       
-      let audioBuffer = new Uint8Array(0);
+      // Use object to hold buffer so we can reference it from stopRecording
+      const audioBufferHolder = { data: new Uint8Array(0) };
+      audioBufferRef = audioBufferHolder;
+      audioProcessorRef = processor;
+      audioSourceRef = mediaSource;
       
       processor.onaudioprocess = (event) => {
         const input = event.inputBuffer.getChannelData(0);
@@ -1153,22 +1160,21 @@
         }
         
         // Accumulate and send in 1.5s batches (24,000 samples at 16kHz)
-        const newBuffer = new Uint8Array(audioBuffer.length + pcm16.byteLength);
-        newBuffer.set(new Uint8Array(audioBuffer));
-        newBuffer.set(new Uint8Array(pcm16.buffer), audioBuffer.length);
-        audioBuffer = newBuffer;
+        const newBuffer = new Uint8Array(audioBufferHolder.data.length + pcm16.byteLength);
+        newBuffer.set(new Uint8Array(audioBufferHolder.data));
+        newBuffer.set(new Uint8Array(pcm16.buffer), audioBufferHolder.data.length);
+        audioBufferHolder.data = newBuffer;
         
         const batchSize = 24000 * 2;  // 1.5s at 16kHz in bytes (PCM16)
-        if (audioBuffer.length >= batchSize && audioSocket && audioSocket.readyState === WebSocket.OPEN) {
-          audioSocket.send(audioBuffer.slice(0, batchSize));
-          audioBuffer = audioBuffer.slice(batchSize);
+        if (audioBufferHolder.data.length >= batchSize && audioSocket && audioSocket.readyState === WebSocket.OPEN) {
+          const chunk = audioBufferHolder.data.slice(0, batchSize);
+          audioSocket.send(chunk);
+          console.log(`[Audio] Sent ${chunk.byteLength} bytes to server`);
+          audioBufferHolder.data = audioBufferHolder.data.slice(batchSize);
         }
       };
       
-      mediaSource.connect(processor);
-      processor.connect(audioContext.destination);
-      
-      // Connect to WebSocket for audio streaming
+      // Connect to WebSocket for audio streaming FIRST
       const params = new URLSearchParams();
       // Don't pass text param - that triggers text mode
       const voiceValue = voiceSelect.value || '';
@@ -1179,6 +1185,26 @@
       
       audioSocket = new WebSocket(wsUrl);
       audioSocket.binaryType = 'arraybuffer';
+      
+      // Wait for WebSocket to open before starting audio
+      await new Promise((resolve, reject) => {
+        audioSocket.onopen = () => {
+          appendLog('[Frontend] WebSocket connected');
+          recordingStatus.textContent = 'Recording... speak now';
+          transcriptionPreview.textContent = 'Listening...';
+          resolve();
+        };
+        audioSocket.onerror = (err) => {
+          console.error('Audio WebSocket connection error', err);
+          reject(new Error('WebSocket connection failed'));
+        };
+        // Timeout after 5 seconds
+        setTimeout(() => reject(new Error('WebSocket connection timeout')), 5000);
+      });
+      
+      // Now connect audio processing
+      mediaSource.connect(processor);
+      processor.connect(audioContext.destination);
       
       audioSocket.onmessage = (event) => {
         if (typeof event.data === 'string') {
@@ -1229,6 +1255,8 @@
         }
       };
       
+      // Set error and close handlers after connection established
+      const originalOnError = audioSocket.onerror;
       audioSocket.onerror = (err) => {
         console.error('Audio WebSocket error', err);
         transcriptionStatus.textContent = `WebSocket error: ${err?.message || 'Unknown'}`;
@@ -1236,16 +1264,26 @@
       };
       
       audioSocket.onclose = () => {
-        mediaSource.disconnect();
-        processor.disconnect();
-        audioContext.close();
+        console.log('[WebSocket] Connection closed');
+        // Clean up will be done by stopRecording
       };
       
       startRecordingTimer();
       appendLog('[Frontend] Recording started');
     } catch (err) {
-      recordingStatus.textContent = `Microphone error: ${err.message}`;
-      appendLog(`[Error] Microphone error: ${err.message}`);
+      recordingStatus.textContent = `Error: ${err.message}`;
+      appendLog(`[Error] ${err.message}`);
+      // Clean up on error
+      if (mediaRecorder) {
+        mediaRecorder.stop();
+        mediaRecorder.stream.getTracks().forEach(track => track.stop());
+      }
+      if (audioSocket && audioSocket.readyState === WebSocket.OPEN) {
+        audioSocket.close();
+      }
+      isRecording = false;
+      recordBtn.style.display = 'inline-block';
+      stopBtn.style.display = 'none';
     }
   };
 
@@ -1262,10 +1300,27 @@
     stopBtn.style.display = 'none';
     stopRecordingTimer();
     
-    // Send final audio_end signal
+    // Flush any remaining audio buffer before sending end signal
     if (audioSocket && audioSocket.readyState === WebSocket.OPEN) {
+      if (audioBufferRef && audioBufferRef.data && audioBufferRef.data.length > 0) {
+        console.log(`[Audio] Flushing final ${audioBufferRef.data.byteLength} bytes`);
+        audioSocket.send(audioBufferRef.data);
+        audioBufferRef.data = new Uint8Array(0);
+      }
+      
+      // Send final audio_end signal
       audioSocket.send(JSON.stringify({ type: 'audio_end' }));
       appendLog('[Frontend] Sent audio_end signal');
+    }
+    
+    // Clean up audio processing
+    if (audioProcessorRef && audioSourceRef) {
+      try {
+        audioSourceRef.disconnect();
+        audioProcessorRef.disconnect();
+      } catch (e) {
+        console.log('Error disconnecting audio nodes:', e);
+      }
     }
     
     recordingStatus.textContent = 'Recording stopped';
