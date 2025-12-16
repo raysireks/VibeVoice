@@ -30,6 +30,12 @@ try:
 except ImportError:
     WhisperModel = None
 
+# Optional punctuation restoration model for sentence boundary detection
+try:
+    from deepmultilingualpunctuation import PunctuationModel
+except ImportError:
+    PunctuationModel = None
+
 import copy
 
 BASE = Path(__file__).parent
@@ -65,6 +71,7 @@ class StreamingTTSService:
         # STT (Faster Whisper) components
         self.whisper_model: Optional[Any] = None  # WhisperModel instance
         self.stt_device = device  # Use same device as TTS
+        self.punct_model: Optional[Any] = None  # DeepMultilingualPunctuation model
 
         if device == "mpx":
             print("Note: device 'mpx' detected, treating it as 'mps'.")
@@ -135,6 +142,27 @@ class StreamingTTSService:
         
         # Lazy-load Whisper model for STT
         self._load_whisper()
+        self._load_punctuation_model()
+
+    def _load_punctuation_model(self) -> None:
+        """Lazy-load punctuation restoration model to improve sentence boundary detection."""
+        enable = os.environ.get("STT_USE_PUNCT_MODEL", "1") != "0"
+        if not enable:
+            print("[startup] Punctuation model disabled via STT_USE_PUNCT_MODEL=0")
+            self.punct_model = None
+            return
+        if PunctuationModel is None:
+            print("[startup] deepmultilingualpunctuation not installed; sentence restoration unavailable.")
+            self.punct_model = None
+            return
+        try:
+            # Model uses transformers/torch; CPU is sufficient; GPU optional
+            print("[startup] Loading punctuation restoration model")
+            self.punct_model = PunctuationModel()
+            print("[startup] Punctuation restoration model loaded")
+        except Exception as e:
+            print(f"[startup] Failed to load punctuation model: {e}")
+            self.punct_model = None
 
     def _load_whisper(self, model_size: Optional[str] = None) -> None:
         """Lazy-load Faster Whisper model for speech-to-text."""
@@ -402,88 +430,58 @@ class StreamingTTSService:
         pcm = (chunk * 32767.0).astype(np.int16)
         return pcm.tobytes()
 
-    @staticmethod
-    def extract_complete_sentences(buffer: str) -> Tuple[list, str]:
+    def restore_and_split_sentences(self, buffer: str) -> Tuple[list, str]:
         """
-        Extract complete sentences from accumulated transcribed text using NLTK's punkt tokenizer.
-        
-        This works on the raw transcribed text WITHOUT relying on Whisper's punctuation,
-        using statistical patterns to detect sentence boundaries.
-        
-        Returns:
-            Tuple of (list of complete sentences, remaining incomplete text)
-        
-        Example:
-            >>> extract_complete_sentences("hello world how are you doing today")
-            (["hello world", "how are you doing today"], "")
+        Restore punctuation (if model available) and split into complete sentences.
+        Falls back to NLTK sent_tokenize or simple heuristics if model isn't available.
         """
-        import nltk
-        try:
-            from nltk.tokenize import sent_tokenize
-        except LookupError:
-            # Download punkt tokenizer data if not available
-            import ssl
-            try:
-                _create_unverified_https_context = ssl._create_unverified_context
-            except AttributeError:
-                pass
-            else:
-                ssl._create_default_https_context = _create_unverified_https_context
-            nltk.download('punkt', quiet=True)
-            nltk.download('punkt_tab', quiet=True)
-            from nltk.tokenize import sent_tokenize
-        
-        if not buffer.strip():
+        txt = buffer.strip()
+        if not txt:
             return [], ""
-        
-        # Use NLTK's sentence tokenizer which works on raw text without punctuation
-        # It uses statistical patterns to detect sentence boundaries
+        punctuated = None
+        # Try punctuation restoration model first
+        if self.punct_model is not None:
+            try:
+                punctuated = self.punct_model.restore_punctuation(txt)
+            except Exception as e:
+                print(f"[punct_model] restore failed: {e}")
+                punctuated = None
+        # If punctuation restored, use straightforward split on terminal punctuation
+        if punctuated:
+            import re
+            parts = re.split(r"(?<=[.!?])\s+", punctuated)
+            parts = [p.strip() for p in parts if p.strip()]
+            if not parts:
+                return [], txt
+            # Keep last part buffered if it doesn't end with terminal punctuation
+            if not parts[-1].endswith(('.', '!', '?')):
+                return parts[:-1], parts[-1]
+            return parts, ""
+        # Fallback: use NLTK if available
         try:
-            detected_sentences = sent_tokenize(buffer)
+            import nltk
+            from nltk.tokenize import sent_tokenize
+            sentences = sent_tokenize(txt)
+            if not sentences:
+                return [], txt
+            # Keep last if short and no terminal punctuation
+            last = sentences[-1]
+            if (len(last.split()) < 5) and (not last.endswith(('.', '!', '?'))):
+                return sentences[:-1], last
+            return sentences, ""
         except Exception as e:
-            print(f"[sentence_tokenizer] NLTK tokenization failed: {e}, falling back to word-count chunking")
-            # Fallback: chunk by word count if NLTK fails
-            words = buffer.split()
-            if len(words) < 8:  # Too short, keep buffering
-                return [], buffer
-            # Split into ~10-word chunks
+            print(f"[sentence_tokenizer] NLTK tokenization failed: {e}, using word-count fallback")
+            # Heuristic: chunk by ~10 words
+            words = txt.split()
+            if len(words) < 8:
+                return [], txt
             sentences = []
             for i in range(0, len(words), 10):
                 chunk = " ".join(words[i:i+10])
-                if len(chunk.split()) >= 5:  # Only yield if substantial
+                if len(chunk.split()) >= 5:
                     sentences.append(chunk)
             remaining = "" if len(words) % 10 == 0 else " ".join(words[-(len(words) % 10):])
             return sentences, remaining
-        
-        if not detected_sentences:
-            return [], buffer
-        
-        # If buffer ends mid-sentence (last sentence doesn't look complete), keep it buffered
-        # Heuristic: if last "sentence" is < 5 words and buffer doesn't end with strong punctuation, keep buffering
-        if len(detected_sentences) > 1:
-            complete_sentences = detected_sentences[:-1]
-            last_sentence = detected_sentences[-1]
-            
-            # Check if last sentence looks incomplete (short and no terminal punctuation)
-            word_count = len(last_sentence.split())
-            has_terminal_punct = last_sentence.rstrip().endswith(('.', '!', '?'))
-            
-            if word_count < 5 and not has_terminal_punct:
-                # Keep last sentence in buffer for next window
-                return complete_sentences, last_sentence
-            else:
-                # Last sentence looks complete enough
-                return detected_sentences, ""
-        else:
-            # Only one sentence detected
-            single_sentence = detected_sentences[0]
-            word_count = len(single_sentence.split())
-            
-            # If it's very short (< 5 words) and doesn't end with punctuation, keep buffering
-            if word_count < 5 and not single_sentence.rstrip().endswith(('.', '!', '?')):
-                return [], buffer
-            else:
-                return [single_sentence], ""
 
     async def stream_stt(
         self,
@@ -610,7 +608,7 @@ class StreamingTTSService:
                         if sentence_mode and raw_text:
                             # Sentence mode: accumulate into buffer and yield complete sentences
                             sentence_buffer += raw_text + " "
-                            sentences, sentence_buffer = self.extract_complete_sentences(sentence_buffer)
+                            sentences, sentence_buffer = self.restore_and_split_sentences(sentence_buffer)
                             
                             for sentence in sentences:
                                 # Optionally strip punctuation from each sentence
@@ -666,7 +664,7 @@ class StreamingTTSService:
                         if sentence_mode and raw_text:
                             # Add final window to buffer and flush all remaining text
                             sentence_buffer += raw_text + " "
-                            sentences, remaining = self.extract_complete_sentences(sentence_buffer)
+                            sentences, remaining = self.restore_and_split_sentences(sentence_buffer)
                             
                             # Yield all complete sentences
                             for sentence in sentences:
@@ -758,6 +756,7 @@ async def websocket_stream(ws: WebSocket) -> None:
     stt_window_ms = int(ws.query_params.get("stt_window_ms", os.environ.get("STT_WINDOW_SIZE_MS", "1000")))
     stt_silence_db = float(ws.query_params.get("stt_silence_db", os.environ.get("STT_SILENCE_THRESHOLD_DB", "-40")))
     stt_model_size = ws.query_params.get("stt_model_size", os.environ.get("STT_MODEL_SIZE", "large-v3"))
+    stt_use_punct_model = (ws.query_params.get("stt_use_punct_model", os.environ.get("STT_USE_PUNCT_MODEL", "1")) not in ("0", "false", "no", "off"))
     stt_sentence_mode = parse_bool(
         ws.query_params.get("stt_sentence_mode"),
         os.environ.get("STT_SENTENCE_MODE", "1") != "0",
@@ -870,6 +869,13 @@ async def websocket_stream(ws: WebSocket) -> None:
                     if chunk is None:
                         break
                     yield chunk
+
+            # Ensure punctuation model loaded based on flag
+            if stt_use_punct_model and service.punct_model is None:
+                try:
+                    service._load_punctuation_model()
+                except Exception as e:
+                    print(f"[startup] Punctuation model load error: {e}")
 
             stt_gen = service.stream_stt(
                 audio_gen(),

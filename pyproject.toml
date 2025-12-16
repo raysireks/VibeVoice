@@ -35,7 +35,8 @@ dependencies = [
     "uvicorn[standard]",
     "fastapi",
     "faster-whisper",
-    "nltk"
+    "nltk",
+    "deepmultilingualpunctuation"
 ]
 
 
