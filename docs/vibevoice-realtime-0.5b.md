@@ -121,6 +121,46 @@ Tip: Just try it on [Colab](https://colab.research.google.com/github/microsoft/V
 python demo/realtime_model_inference_from_file.py --model_path microsoft/VibeVoice-Realtime-0.5B --txt_path demo/text_examples/1p_vibevoice.txt --speaker_name Carter
 ```
 
+### Usage 3: Launch with HTTPS (SSL/TLS)
+For secure WebSocket connections (required for microphone access on non-localhost domains), you can enable HTTPS using SSL certificates.
+
+#### Creating Self-Signed Certificates for Development (myapp.com)
+
+1. **Generate self-signed certificate:**
+```bash
+# Generate private key and certificate valid for 365 days
+openssl req -x509 -newkey rsa:4096 -nodes \
+  -keyout myapp.key \
+  -out myapp.crt \
+  -days 365 \
+  -subj "/CN=myapp.com"
+```
+
+2. **Add myapp.com to your hosts file:**
+```bash
+# On macOS/Linux
+echo "127.0.0.1 myapp.com" | sudo tee -a /etc/hosts
+
+# On Windows (run as Administrator in PowerShell)
+Add-Content -Path C:\Windows\System32\drivers\etc\hosts -Value "127.0.0.1 myapp.com"
+```
+
+3. **Launch with SSL certificates:**
+```bash
+python demo/vibevoice_realtime_demo.py \
+  --model_path microsoft/VibeVoice-Realtime-0.5B \
+  --port 3000 \
+  --ssl-keyfile myapp.key \
+  --ssl-certfile myapp.crt
+```
+
+4. **Access the application:**
+   - Open your browser and navigate to `https://myapp.com:3000`
+   - You'll see a security warning (expected for self-signed certificates)
+   - Click "Advanced" → "Proceed to myapp.com" to accept the certificate
+
+**Note:** For production deployments, use certificates from a trusted Certificate Authority (e.g., Let's Encrypt).
+
 
 ## Risks and limitations
 
